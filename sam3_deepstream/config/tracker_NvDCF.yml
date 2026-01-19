@@ -1,0 +1,90 @@
+# NvDCF (Discriminative Correlation Filter) Tracker Configuration
+# Optimized for SAM3 segmentation mask tracking
+
+%YAML:1.0
+
+# Base tracker configuration
+BaseConfig:
+  # Tracker type: IOU, NvSORT, NvDeepSORT, or NvDCF
+  tracker_type: NvDCF
+  # GPU device for tracker
+  gpuId: 0
+  # Enable visual features for re-identification
+  enable_past_frame: 1
+
+# Target management settings
+TargetManagement:
+  # Maximum targets to track per stream
+  maxTargetsPerStream: 50
+  # Minimum age before target is confirmed
+  probationAge: 3
+  # Maximum frames to keep tracking without detection
+  maxShadowTrackingAge: 30
+  # Frames to keep coasted tracks before deletion
+  maxCoastedTrackingAge: 60
+  # Early termination age for low-quality targets
+  earlyTerminationAge: 1
+
+# Data association settings
+DataAssociator:
+  # 0: GREEDY, 1: CASCADED
+  associationMatcherType: 1
+  # IOU threshold for matching
+  matchingScoreWeight4Iou: 0.6
+  # Visual similarity weight
+  matchingScoreWeight4VisualSimilarity: 0.4
+  # Minimum IOU for valid match
+  minMatchingScore4Overall: 0.3
+  # IOU threshold for coasted tracks
+  minIouThreshold4Tracker: 0.2
+  # Use bounding box smoothing
+  smoothLocationPredictor: 1
+  # Kalman filter for motion prediction
+  useKalmanFilter: 1
+
+# NvDCF specific settings
+NvDCF:
+  # Feature extraction
+  useColorNames: 1
+  useHog: 1
+  # Feature image size level (0=smallest, 2=largest)
+  featureImgSizeLevel: 2
+  # Search region padding
+  searchRegionPaddingScale: 2.0
+  # Filter learning rate
+  filterLr: 0.15
+  # Filter regularization
+  filterCfRegLambda: 0.1
+  # Gaussian target sigma
+  gaussianSigma: 0.6
+  # Scale estimation
+  numScales: 3
+  scaleStep: 1.05
+  # Interpolation factor for scale filter
+  scaleFilterLr: 0.025
+  # High score threshold
+  highScoreThreshold: 0.4
+  # Low score threshold for re-detection
+  lowScoreThreshold: 0.2
+
+# Tracking state machine
+StateEstimator:
+  # Process noise for Kalman filter
+  processNoiseVarX: 0.1
+  processNoiseVarY: 0.1
+  processNoiseVarW: 0.04
+  processNoiseVarH: 0.04
+  # Measurement noise
+  measurementNoiseVarX: 0.1
+  measurementNoiseVarY: 0.1
+  measurementNoiseVarW: 0.1
+  measurementNoiseVarH: 0.1
+
+# ReID network settings (for visual similarity)
+# Uncomment and configure if using deep re-identification
+# ReID:
+#   reidType: 0  # 0=None, 1=NvDCF, 2=Deep
+#   batchSize: 16
+#   inferDims: 128;64;3
+#   onnxFile: reid.onnx
+#   engineFile: reid.engine

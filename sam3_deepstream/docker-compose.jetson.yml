@@ -1,0 +1,55 @@
+# SAM3 Inference API - Jetson Override
+#
+# Use with docker-compose.yml:
+#   docker-compose -f docker-compose.yml -f docker-compose.jetson.yml up -d
+
+version: "3.8"
+
+services:
+  sam3-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.jetson
+    image: sam3-api:jetson
+
+    # Jetson uses different runtime configuration
+    runtime: nvidia
+    privileged: true  # Required for some Jetson features
+
+    environment:
+      # Jetson-specific optimizations
+      - CUDA_CACHE_DISABLE=0
+      - CUDA_CACHE_PATH=/workspace/.cuda_cache
+      - TRT_ENGINE_CACHE_ENABLE=1
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      # Use unified memory on Jetson
+      - PYTORCH_CUDA_MEMORY_FRACTION=0.8
+
+    volumes:
+      # Mount engines
+      - ./engines:/workspace/engines:ro
+      # Mount data
+      - ./data:/workspace/data
+      # Cache CUDA kernels
+      - sam3-cuda-cache:/workspace/.cuda_cache
+
+    # Jetson typically has less memory, adjust health check timing
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 120s  # TRT engine loading can take time
+
+    # Memory limits for Jetson (adjust based on your model)
+    # AGX Orin has 32GB/64GB unified memory
+    deploy:
+      resources:
+        limits:
+          memory: 24g
+        reservations:
+          memory: 8g
+
+volumes:
+  sam3-cuda-cache:
+    driver: local

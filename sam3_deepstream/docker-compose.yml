@@ -1,0 +1,95 @@
+# SAM3 Inference API - Docker Compose Configuration
+#
+# Usage:
+#   # Start the service
+#   docker-compose up -d
+#
+#   # View logs
+#   docker-compose logs -f
+#
+#   # Stop the service
+#   docker-compose down
+#
+# For Jetson:
+#   docker-compose -f docker-compose.yml -f docker-compose.jetson.yml up -d
+
+version: "3.8"
+
+services:
+  sam3-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sam3-api:latest
+    container_name: sam3-api
+    restart: unless-stopped
+
+    # NVIDIA runtime for GPU access
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      # Mount TensorRT engines
+      - ./engines:/workspace/engines:ro
+      # Mount data directory for input/output
+      - ./data:/workspace/data
+      # Optional: Mount logs
+      - ./logs:/workspace/logs
+
+    environment:
+      # Engine paths
+      - SAM3_ENCODER_ENGINE=/workspace/engines/sam3_encoder.engine
+      - SAM3_DECODER_ENGINE=/workspace/engines/sam3_decoder.engine
+      # CUDA configuration
+      - CUDA_DEVICE=0
+      - CUDA_VISIBLE_DEVICES=0
+      # Server configuration
+      - HOST=0.0.0.0
+      - PORT=8000
+      - WORKERS=1
+      - USE_ASYNC=true
+      # Logging
+      - LOG_LEVEL=info
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    # Limit resources (adjust for your system)
+    # mem_limit: 16g
+    # memswap_limit: 16g
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  # Optional: Nginx reverse proxy
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: sam3-nginx
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #     - ./ssl:/etc/nginx/ssl:ro
+  #   depends_on:
+  #     - sam3-api
+
+networks:
+  default:
+    name: sam3-network

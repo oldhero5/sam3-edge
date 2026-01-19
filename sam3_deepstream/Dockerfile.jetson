@@ -1,0 +1,75 @@
+# SAM3 Inference API - Jetson Optimized Container
+#
+# This Dockerfile is optimized for Jetson AGX Orin with JetPack 6.x
+#
+# Build on Jetson:
+#   docker build -f Dockerfile.jetson -t sam3-api:jetson .
+#
+# Or use jetson-containers:
+#   jetson-containers build --name sam3-api pytorch tensorrt
+#
+# Run:
+#   docker run --runtime nvidia --gpus all -p 8000:8000 \
+#     -v $(pwd)/engines:/workspace/engines \
+#     -v /tmp/.X11-unix:/tmp/.X11-unix \
+#     -e DISPLAY=$DISPLAY \
+#     sam3-api:jetson
+
+# Use dusty-nv's l4t-pytorch image (includes PyTorch, TensorRT, CUDA)
+ARG L4T_VERSION=r36.4.0
+FROM dustynv/l4t-pytorch:${L4T_VERSION}
+
+# Set environment
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# The base image already has PyTorch, TensorRT, CUDA
+# Just install FastAPI and other Python deps
+
+WORKDIR /workspace
+
+# Install Python dependencies
+RUN pip3 install --no-cache-dir \
+    fastapi>=0.104.0 \
+    uvicorn[standard]>=0.24.0 \
+    python-multipart>=0.0.6 \
+    pydantic>=2.0.0 \
+    pillow>=10.0.0 \
+    aiofiles>=23.0.0
+
+# Copy application code
+COPY sam3_deepstream /workspace/sam3_deepstream
+COPY pyproject.toml /workspace/
+
+# Install sam3_deepstream package
+RUN pip3 install --no-cache-dir -e .
+
+# Create directories
+RUN mkdir -p /workspace/engines /workspace/data /workspace/logs
+
+# Environment configuration
+ENV SAM3_ENCODER_ENGINE=/workspace/engines/sam3_encoder.engine
+ENV SAM3_DECODER_ENGINE=/workspace/engines/sam3_decoder.engine
+ENV CUDA_DEVICE=0
+ENV USE_ASYNC=true
+ENV HOST=0.0.0.0
+ENV PORT=8000
+ENV WORKERS=1
+
+# Jetson-specific optimizations
+ENV CUDA_CACHE_DISABLE=0
+ENV CUDA_CACHE_PATH=/workspace/.cuda_cache
+ENV TRT_ENGINE_CACHE_ENABLE=1
+
+# Memory optimization for Jetson
+ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
+# Default command
+CMD ["python3", "-m", "sam3_deepstream.api.server"]

@@ -1,0 +1,14 @@
+[project]
+name = "sam3-edge"
+version = "0.1.0"
+description = "SAM3 Edge Computing System for Jetson AGX Orin"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv.workspace]
+members = ["sam3_deepstream"]
+
+[tool.uv.sources]
+# sam3 pulled from your fork - update URL if different
+sam3 = { git = "https://github.com/oldhero5/sam3.git", branch = "feature/jetson-orin-support" }
+sam3-deepstream = { workspace = true }

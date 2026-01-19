@@ -1,0 +1,48 @@
+# SAM3 TensorRT nvinfer configuration for DeepStream
+# Network type 2 = Segmentation
+
+[property]
+gpu-id=0
+net-scale-factor=0.00392156862745098
+# Normalization: 1/255 = 0.00392156862745098
+
+# Model files - use absolute path for DeepStream
+model-engine-file=/mnt/repos/sam3_test/sam3_deepstream/engines/sam3_encoder.engine
+
+# Network configuration
+network-type=2
+batch-size=1
+process-mode=1
+
+# Input specifications (SAM3 uses 1008x1008, use 1024 for efficiency)
+infer-dims=3;1008;1008
+maintain-aspect-ratio=1
+
+# Segmentation threshold
+segmentation-threshold=0.5
+
+# Performance settings
+# interval=N means run inference every (N+1) frames
+# With interval=4, inference runs on frames 0, 5, 10, 15...
+interval=4
+
+# Precision: 0=FP32, 1=FP16, 2=INT8
+network-mode=1
+
+# DLA configuration (set enable-dla=1 for Jetson DLA offload)
+enable-dla=0
+use-dla-core=0
+
+# Output layer names (customize based on model)
+output-blob-names=features
+
+# Memory optimization
+workspace-size=4096
+
+# CRITICAL: Enable output tensor metadata for custom post-processing
+# This allows accessing raw encoder output tensors in GStreamer probes
+output-tensor-meta=1
+
+# Custom library for post-processing (optional)
+# custom-lib-path=/path/to/libsam3_postprocess.so
+# parse-bbox-func-name=NvDsInferParseSAM3
