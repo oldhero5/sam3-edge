@@ -10,8 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from ..config import get_config, SAM3DeepStreamConfig
 from ..export.engine_manager import EngineManager
-from .routes import health, stream, video
+from .routes import health, stream, video, nlq
 from .services.job_manager import JobManager
+from .services.detection_store import DetectionStore, set_detection_store
+from .services.embedding_service import EmbeddingService, set_embedding_service
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,34 @@ async def lifespan(app: FastAPI):
 
     # Start job processor
     job_manager.start()
+
+    # Initialize detection store (SQLite + FAISS)
+    detection_store = DetectionStore(
+        db_path=config.database.db_path,
+        index_path=config.database.faiss_index_path,
+        embedding_dim=config.database.embedding_dim,
+        use_gpu=config.database.use_gpu,
+    )
+    await detection_store.initialize()
+    set_detection_store(detection_store)
+    app.state.detection_store = detection_store
+    logger.info(f"Detection store initialized: {config.database.db_path}")
+
+    # Register this device for federation
+    await detection_store.register_device(
+        device_id=config.federation.device_id,
+        hostname=config.federation.hostname,
+    )
+
+    # Initialize embedding service
+    embedding_service = EmbeddingService(device="cuda")
+    try:
+        embedding_service.initialize()
+        set_embedding_service(embedding_service)
+        app.state.embedding_service = embedding_service
+        logger.info("Embedding service initialized")
+    except Exception as e:
+        logger.warning(f"Embedding service initialization failed: {e}")
 
     # Try to load engines if available
     if engine_manager.are_engines_available():
@@ -65,6 +95,8 @@ async def lifespan(app: FastAPI):
     # Cleanup
     logger.info("Shutting down...")
     job_manager.stop()
+    if hasattr(app.state, "detection_store"):
+        app.state.detection_store.close()
     if hasattr(app.state, "engine_manager"):
         app.state.engine_manager.cleanup()
 
@@ -95,6 +127,7 @@ def create_app(config: Optional[SAM3DeepStreamConfig] = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(video.router)
     app.include_router(stream.router)
+    app.include_router(nlq.router)
 
     return app
 

@@ -25,6 +25,14 @@ class RLEMask(BaseModel):
     box: Tuple[float, float, float, float] = Field(
         description="Normalized bounding box (x1, y1, x2, y2)"
     )
+    text_prompt: Optional[str] = Field(
+        default=None,
+        description="Text prompt used for detection"
+    )
+    label: Optional[str] = Field(
+        default=None,
+        description="Detected object label"
+    )
 
 
 class SegmentationResult(BaseModel):
@@ -68,6 +76,14 @@ class JobStatusResponse(BaseModel):
     error: Optional[str] = Field(
         default=None,
         description="Error message if failed",
+    )
+    detection_count: Optional[int] = Field(
+        default=None,
+        description="Number of detections stored",
+    )
+    text_prompt: Optional[str] = Field(
+        default=None,
+        description="Text prompt used for detection",
     )
 
 

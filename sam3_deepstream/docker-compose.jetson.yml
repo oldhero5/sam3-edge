@@ -24,6 +24,10 @@ services:
       - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
       # Use unified memory on Jetson
       - PYTORCH_CUDA_MEMORY_FRACTION=0.8
+      # Database configuration for NLQ
+      - SAM3_DB_PATH=/workspace/db/detections.db
+      - SAM3_FAISS_INDEX=/workspace/db/embeddings.index
+      - SAM3_USE_GPU_FAISS=true
 
     volumes:
       # Mount engines
@@ -32,6 +36,8 @@ services:
       - ./data:/workspace/data
       # Cache CUDA kernels
       - sam3-cuda-cache:/workspace/.cuda_cache
+      # Persistent database storage for NLQ
+      - sam3-db:/workspace/db
 
     # Jetson typically has less memory, adjust health check timing
     healthcheck:
@@ -52,4 +58,6 @@ services:
 
 volumes:
   sam3-cuda-cache:
+    driver: local
+  sam3-db:
     driver: local

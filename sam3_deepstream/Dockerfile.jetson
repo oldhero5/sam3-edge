@@ -29,6 +29,11 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /workspace
 
+# Install system dependencies for SQLite
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install Python dependencies
 RUN pip3 install --no-cache-dir \
     fastapi>=0.104.0 \
@@ -36,7 +41,9 @@ RUN pip3 install --no-cache-dir \
     python-multipart>=0.0.6 \
     pydantic>=2.0.0 \
     pillow>=10.0.0 \
-    aiofiles>=23.0.0
+    aiofiles>=23.0.0 \
+    aiosqlite>=0.19.0 \
+    faiss-gpu>=1.7.4
 
 # Copy application code
 COPY sam3_deepstream /workspace/sam3_deepstream
@@ -46,7 +53,7 @@ COPY pyproject.toml /workspace/
 RUN pip3 install --no-cache-dir -e .
 
 # Create directories
-RUN mkdir -p /workspace/engines /workspace/data /workspace/logs
+RUN mkdir -p /workspace/engines /workspace/data /workspace/logs /workspace/db
 
 # Environment configuration
 ENV SAM3_ENCODER_ENGINE=/workspace/engines/sam3_encoder.engine
@@ -57,6 +64,11 @@ ENV HOST=0.0.0.0
 ENV PORT=8000
 ENV WORKERS=1
 
+# Database configuration for NLQ
+ENV SAM3_DB_PATH=/workspace/db/detections.db
+ENV SAM3_FAISS_INDEX=/workspace/db/embeddings.index
+ENV SAM3_USE_GPU_FAISS=true
+
 # Jetson-specific optimizations
 ENV CUDA_CACHE_DISABLE=0
 ENV CUDA_CACHE_PATH=/workspace/.cuda_cache
@@ -64,6 +76,9 @@ ENV TRT_ENGINE_CACHE_ENABLE=1
 
 # Memory optimization for Jetson
 ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+
+# Persistent volume for database
+VOLUME /workspace/db
 
 EXPOSE 8000
 

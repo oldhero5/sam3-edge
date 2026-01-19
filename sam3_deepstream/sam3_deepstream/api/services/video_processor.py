@@ -1,11 +1,13 @@
 """Video processing service for DeepStream pipeline orchestration."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import tempfile
+import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -15,6 +17,8 @@ from ...inference.keyframe_processor import FrameResult, KeyframeProcessor
 from ...inference.mask_propagation import MaskPropagator
 from ...utils.mask_utils import encode_rle, visualize_masks
 from ..models.requests import OutputFormat, VideoProcessRequest
+from .detection_store import Detection, DetectionStore, VideoMetadata, get_detection_store
+from .embedding_service import EmbeddingService, get_embedding_service
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +88,7 @@ class VideoProcessor:
         request: VideoProcessRequest,
         output_path: Path,
         progress_callback=None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> dict:
         """
         Process a video file.
@@ -93,11 +98,20 @@ class VideoProcessor:
             request: Processing request parameters
             output_path: Path for output
             progress_callback: Optional callback for progress updates
+            metadata: Optional metadata (text_prompt, store_masks, store_embeddings)
 
         Returns:
             Processing results dictionary
         """
-        if self.use_deepstream:
+        metadata = metadata or {}
+        store_detections = metadata.get("store_masks", True) or metadata.get("store_embeddings", True)
+
+        # Use text prompt processing if text_prompt is provided
+        if request.text_prompt:
+            return await self._process_with_text_prompt(
+                video_path, request, output_path, progress_callback, metadata
+            )
+        elif self.use_deepstream:
             return await self._process_with_deepstream(
                 video_path, request, output_path, progress_callback
             )
@@ -105,6 +119,238 @@ class VideoProcessor:
             return await self._process_with_opencv(
                 video_path, request, output_path, progress_callback
             )
+
+    async def _process_with_text_prompt(
+        self,
+        video_path: Path,
+        request: VideoProcessRequest,
+        output_path: Path,
+        progress_callback=None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> dict:
+        """
+        Process video using SAM3's text-based segmentation.
+
+        Uses Sam3Processor.set_text_prompt() for natural language object detection.
+        """
+        metadata = metadata or {}
+        store_masks = metadata.get("store_masks", True)
+        store_embeddings = metadata.get("store_embeddings", True)
+
+        # Import SAM3 components
+        try:
+            from sam3.model_builder import build_sam3_image_model
+            from sam3.model.sam3_image_processor import Sam3Processor
+        except ImportError as e:
+            logger.error(f"SAM3 not available for text prompt processing: {e}")
+            # Fallback to standard processing
+            return await self._process_with_opencv(
+                video_path, request, output_path, progress_callback
+            )
+
+        # Open video
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {video_path}")
+
+        # Get video properties
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Generate video_id and compute hash
+        video_id = str(uuid.uuid4())
+        video_hash = self._compute_file_hash(video_path)
+
+        # Store video metadata
+        detection_store = await get_detection_store()
+        await detection_store.store_video(VideoMetadata(
+            video_id=video_id,
+            device_id=self.config.federation.device_id,
+            filename=video_path.name,
+            file_hash=video_hash,
+            duration_seconds=total_frames / fps if fps > 0 else None,
+            width=width,
+            height=height,
+            total_frames=total_frames,
+        ))
+
+        # Get embedding service for text prompt
+        embedding_service = get_embedding_service()
+        prompt_embedding = None
+        if store_embeddings:
+            prompt_embedding = embedding_service.encode(request.text_prompt)
+
+        # Build SAM3 model
+        try:
+            model = build_sam3_image_model(
+                device="cuda",
+                eval_mode=True,
+                checkpoint_path=str(self.config.sam3_checkpoint) if self.config.sam3_checkpoint else None,
+            )
+            processor = Sam3Processor(model, confidence_threshold=request.segmentation_threshold)
+        except Exception as e:
+            logger.error(f"Failed to build SAM3 model: {e}")
+            cap.release()
+            return {"error": str(e), "frames_processed": 0}
+
+        results: List[FrameResult] = []
+        detections: List[Detection] = []
+        detection_count = 0
+
+        # Process frames
+        frame_idx = 0
+        keyframe_interval = request.keyframe_interval
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Convert BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            timestamp_ms = (frame_idx / fps * 1000) if fps > 0 else None
+
+            is_keyframe = (frame_idx % keyframe_interval == 0)
+
+            if is_keyframe:
+                # Run full inference with text prompt
+                try:
+                    from PIL import Image
+                    pil_image = Image.fromarray(frame_rgb)
+
+                    state = processor.set_image(pil_image)
+                    state = processor.set_text_prompt(request.text_prompt, state)
+
+                    # Extract results
+                    masks = state.get("masks", [])
+                    boxes = state.get("boxes", [])
+                    scores = state.get("scores", [])
+
+                    frame_masks = []
+                    frame_boxes = []
+                    frame_scores = []
+                    frame_object_ids = []
+
+                    for obj_idx, (mask, box, score) in enumerate(zip(masks, boxes, scores)):
+                        if score < request.segmentation_threshold:
+                            continue
+
+                        # Convert mask to numpy if tensor
+                        if hasattr(mask, 'cpu'):
+                            mask_np = mask.cpu().numpy()
+                        else:
+                            mask_np = np.array(mask)
+
+                        # Normalize box to 0-1
+                        if hasattr(box, 'cpu'):
+                            box = box.cpu().numpy()
+                        box_norm = (
+                            float(box[0]) / width,
+                            float(box[1]) / height,
+                            float(box[2]) / width,
+                            float(box[3]) / height,
+                        )
+
+                        frame_masks.append(mask_np)
+                        frame_boxes.append(box_norm)
+                        frame_scores.append(float(score))
+                        frame_object_ids.append(obj_idx)
+
+                        # Create detection for storage
+                        if store_masks or store_embeddings:
+                            rle = encode_rle(mask_np) if store_masks else None
+                            detection = Detection(
+                                video_id=video_id,
+                                device_id=self.config.federation.device_id,
+                                frame_idx=frame_idx,
+                                timestamp_ms=timestamp_ms,
+                                object_id=obj_idx,
+                                text_prompt=request.text_prompt,
+                                label=request.text_prompt.split()[0] if request.text_prompt else None,
+                                confidence=float(score),
+                                bbox=box_norm,
+                                mask_rle=rle,
+                            )
+                            detections.append(detection)
+                            detection_count += 1
+
+                    result = FrameResult(
+                        frame_idx=frame_idx,
+                        is_keyframe=True,
+                        masks=frame_masks,
+                        boxes=frame_boxes,
+                        scores=frame_scores,
+                        object_ids=frame_object_ids,
+                    )
+
+                except Exception as e:
+                    logger.error(f"Frame {frame_idx} processing error: {e}")
+                    result = FrameResult(
+                        frame_idx=frame_idx,
+                        is_keyframe=True,
+                        masks=[],
+                        boxes=[],
+                        scores=[],
+                        object_ids=[],
+                    )
+            else:
+                # Propagate from previous frame (simplified)
+                if results and results[-1].masks:
+                    result = FrameResult(
+                        frame_idx=frame_idx,
+                        is_keyframe=False,
+                        masks=results[-1].masks,
+                        boxes=results[-1].boxes,
+                        scores=results[-1].scores,
+                        object_ids=results[-1].object_ids,
+                    )
+                else:
+                    result = FrameResult(
+                        frame_idx=frame_idx,
+                        is_keyframe=False,
+                        masks=[],
+                        boxes=[],
+                        scores=[],
+                        object_ids=[],
+                    )
+
+            results.append(result)
+            frame_idx += 1
+
+            if progress_callback and frame_idx % 10 == 0:
+                progress = frame_idx / total_frames
+                await asyncio.to_thread(progress_callback, progress)
+
+        cap.release()
+
+        # Store detections in batch
+        if detections and store_embeddings and prompt_embedding is not None:
+            # Use same embedding for all detections from same prompt
+            embeddings = np.tile(prompt_embedding, (len(detections), 1))
+            await detection_store.store_detections_batch(detections, embeddings)
+        elif detections:
+            await detection_store.store_detections_batch(detections)
+
+        # Generate output
+        output_result = await self._generate_output(
+            video_path, results, request, output_path
+        )
+
+        output_result["video_id"] = video_id
+        output_result["detection_count"] = detection_count
+        output_result["text_prompt"] = request.text_prompt
+
+        return output_result
+
+    def _compute_file_hash(self, file_path: Path) -> str:
+        """Compute SHA256 hash of file."""
+        sha256_hash = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha256_hash.update(chunk)
+        return sha256_hash.hexdigest()
 
     async def _process_with_deepstream(
         self,

@@ -1,6 +1,7 @@
 """Global configuration for SAM3 DeepStream."""
 
 import os
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -78,12 +79,53 @@ class APIConfig:
 
 
 @dataclass
+class DatabaseConfig:
+    """Database configuration for detection storage."""
+    db_path: Path = field(
+        default_factory=lambda: Path.home() / ".cache" / "sam3_deepstream" / "db" / "detections.db"
+    )
+    faiss_index_path: Path = field(
+        default_factory=lambda: Path.home() / ".cache" / "sam3_deepstream" / "db" / "embeddings.index"
+    )
+    embedding_dim: int = 256  # From VETextEncoder
+    use_gpu: bool = True  # Use FAISS GPU if available
+    max_results: int = 1000
+
+    def __post_init__(self):
+        self.db_path = Path(self.db_path)
+        self.faiss_index_path = Path(self.faiss_index_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass
+class NLQConfig:
+    """Natural Language Query configuration."""
+    default_confidence_threshold: float = 0.5
+    store_masks: bool = True  # Store RLE masks in database
+    store_embeddings: bool = True  # Store embeddings in FAISS
+    similarity_threshold: float = 0.7  # Minimum similarity for search results
+    max_search_results: int = 100
+
+
+@dataclass
+class FederationConfig:
+    """Federation configuration for multi-device deployment."""
+    device_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    hostname: str = field(default_factory=lambda: os.uname().nodename)
+    enable_sync: bool = False
+    sync_endpoint: Optional[str] = None
+
+
+@dataclass
 class SAM3DeepStreamConfig:
     """Main configuration container."""
     trt: TRTConfig = field(default_factory=TRTConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     deepstream: DeepStreamConfig = field(default_factory=DeepStreamConfig)
     api: APIConfig = field(default_factory=APIConfig)
+    database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    nlq: NLQConfig = field(default_factory=NLQConfig)
+    federation: FederationConfig = field(default_factory=FederationConfig)
 
     # Path to SAM3 model checkpoint
     sam3_checkpoint: Optional[Path] = None
@@ -111,6 +153,20 @@ class SAM3DeepStreamConfig:
 
         if keyframe := os.getenv("SAM3_KEYFRAME_INTERVAL"):
             config.inference.keyframe_interval = int(keyframe)
+
+        # Database configuration
+        if db_path := os.getenv("SAM3_DB_PATH"):
+            config.database.db_path = Path(db_path)
+
+        if faiss_path := os.getenv("SAM3_FAISS_INDEX"):
+            config.database.faiss_index_path = Path(faiss_path)
+
+        if use_gpu := os.getenv("SAM3_FAISS_GPU"):
+            config.database.use_gpu = use_gpu.lower() in ("true", "1", "yes")
+
+        # Federation configuration
+        if device_id := os.getenv("SAM3_DEVICE_ID"):
+            config.federation.device_id = device_id
 
         return config
 
