@@ -8,6 +8,7 @@ from typing import Optional, Union
 import torch
 import torch.nn as nn
 
+# Import from sam3.model.trt_export (the actual module path)
 from sam3.model.trt_export import (
     TRTViTWrapper,
     export_vit_to_onnx,

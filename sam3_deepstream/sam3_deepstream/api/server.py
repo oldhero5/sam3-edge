@@ -1,10 +1,8 @@
 """
-FastAPI server for SAM3 TensorRT inference.
+SAM3 Unified API Server
 
-Provides REST API endpoints for:
-- Image encoding (extract features)
-- Mask decoding (generate segmentation masks)
-- Health checks and metrics
+Uses SAM3's native VETextEncoder for text prompt support.
+Provides REST API endpoints for image segmentation with text, point, or box prompts.
 """
 
 import asyncio
@@ -18,9 +16,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 # Configure logging
@@ -30,9 +28,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global inference runtime (initialized on startup)
+# Global runtime
 _runtime = None
-_async_runtime = None
 _startup_time = None
 
 
@@ -40,328 +37,259 @@ _startup_time = None
 # Pydantic Models
 # ============================================================================
 
-class PointPrompt(BaseModel):
-    """Point prompt for mask generation."""
-    x: float = Field(..., description="X coordinate (0-1 normalized or pixel)")
-    y: float = Field(..., description="Y coordinate (0-1 normalized or pixel)")
-    label: int = Field(1, description="1 for foreground, 0 for background")
-
-
-class BoxPrompt(BaseModel):
-    """Bounding box prompt for mask generation."""
-    x1: float = Field(..., description="Top-left X")
-    y1: float = Field(..., description="Top-left Y")
-    x2: float = Field(..., description="Bottom-right X")
-    y2: float = Field(..., description="Bottom-right Y")
-
-
-class EncodeRequest(BaseModel):
-    """Request for image encoding."""
-    image_base64: Optional[str] = Field(None, description="Base64 encoded image")
-    return_embeddings: bool = Field(False, description="Return raw embeddings")
-
-
-class EncodeResponse(BaseModel):
-    """Response from image encoding."""
-    success: bool
-    embedding_shape: List[int]
-    inference_time_ms: float
-    embeddings_base64: Optional[str] = None
-
-
-class DecodeRequest(BaseModel):
-    """Request for mask decoding."""
-    points: Optional[List[PointPrompt]] = Field(None, description="Point prompts")
-    boxes: Optional[List[BoxPrompt]] = Field(None, description="Box prompts")
-    mask_input: Optional[str] = Field(None, description="Base64 encoded mask input")
-    multimask_output: bool = Field(True, description="Return multiple masks")
-
-
-class DecodeResponse(BaseModel):
-    """Response from mask decoding."""
-    success: bool
-    num_masks: int
-    mask_shape: List[int]
-    iou_predictions: List[float]
-    inference_time_ms: float
-    masks_base64: Optional[str] = None
-
-
 class HealthResponse(BaseModel):
     """Health check response."""
     status: str
-    encoder_loaded: bool
-    decoder_loaded: bool
+    model_loaded: bool
     uptime_seconds: float
     gpu_available: bool
     gpu_name: Optional[str] = None
     gpu_memory_used_mb: Optional[float] = None
     gpu_memory_total_mb: Optional[float] = None
+    backbone_type: Optional[str] = None  # "PE" or "ViT"
 
 
 class InferenceStats(BaseModel):
     """Inference statistics."""
     total_requests: int
-    encode_requests: int
-    decode_requests: int
-    avg_encode_time_ms: float
-    avg_decode_time_ms: float
+    text_requests: int
+    point_requests: int
+    avg_inference_time_ms: float
     errors: int
 
 
+class DetectionResult(BaseModel):
+    """Single detection result."""
+    bbox: List[float] = Field(..., description="[x1, y1, x2, y2] in pixels")
+    score: float
+    mask_area: int
+
+
+class SegmentResponse(BaseModel):
+    """Response from segmentation."""
+    success: bool
+    inference_time_ms: float
+    num_detections: int
+    detections: List[DetectionResult]
+
+
 # ============================================================================
-# Inference Runtime
+# SAM3 Runtime (Native Text Support)
 # ============================================================================
 
-class InferenceRuntime:
-    """Manages TRT inference engines and caching."""
+class SAM3Runtime:
+    """
+    Runtime using SAM3's native Sam3Processor with VETextEncoder.
+
+    SAM3 has built-in vision-language capabilities - no separate CLIP needed.
+
+    Supports optional PE (Perception Encoder) backbone for improved
+    text prompt understanding via alignment tuning.
+
+    Set SAM3_USE_PE_BACKBONE=1 to enable PE backbone.
+    """
 
     def __init__(
         self,
-        encoder_path: Optional[str] = None,
-        decoder_path: Optional[str] = None,
-        device: int = 0,
-        use_async: bool = True,
+        checkpoint_path: str,
+        device: str = "cuda",
+        resolution: int = 1008,
+        use_pe_backbone: Optional[bool] = None,
     ):
         self.device = device
-        self.use_async = use_async
-        self.encoder = None
-        self.decoder = None
-        self._cached_embeddings = None
-        self._cached_image_shape = None
+        self.checkpoint_path = checkpoint_path
+        self.resolution = resolution
+        self.processor = None
+        self.model = None
+
+        # Check PE configuration from environment
+        if use_pe_backbone is None:
+            use_pe_backbone = os.environ.get('SAM3_USE_PE_BACKBONE', '0') == '1'
+        self.use_pe_backbone = use_pe_backbone
+        self.use_alignment_tuning = os.environ.get('SAM3_ALIGNMENT_TUNING', '1') == '1'
 
         # Stats
         self.stats = {
             'total_requests': 0,
-            'encode_requests': 0,
-            'decode_requests': 0,
-            'encode_times': [],
-            'decode_times': [],
+            'text_requests': 0,
+            'point_requests': 0,
+            'inference_times': [],
             'errors': 0,
+            'backbone_type': 'PE' if self.use_pe_backbone else 'ViT',
         }
 
-        # Load engines
-        if encoder_path and Path(encoder_path).exists():
-            self._load_encoder(encoder_path)
+    def load_model(self):
+        """Load SAM3 model with native text encoder or PE backbone."""
+        import torch
 
-        if decoder_path and Path(decoder_path).exists():
-            self._load_decoder(decoder_path)
+        if not Path(self.checkpoint_path).exists():
+            logger.warning(f"Checkpoint not found: {self.checkpoint_path}")
+            return False
 
-    def _load_encoder(self, path: str) -> None:
-        """Load encoder TRT engine."""
         try:
-            import torch
-            torch.cuda.set_device(self.device)
+            from sam3.model.sam3_image_processor import Sam3Processor
 
-            if self.use_async:
-                from ..inference.async_trt_runtime import AsyncTRTInferenceEngine
-                self.encoder = AsyncTRTInferenceEngine(path, device=self.device)
+            if self.use_pe_backbone:
+                # Load PE-enhanced model
+                from sam3.model_builder import build_sam3_pe_model
+
+                logger.info(f"Loading SAM3 with PE backbone from {self.checkpoint_path}...")
+                logger.info(f"Alignment tuning: {self.use_alignment_tuning}")
+
+                self.model = build_sam3_pe_model(
+                    checkpoint_path=self.checkpoint_path,
+                    device=self.device,
+                    eval_mode=True,
+                    load_from_HF=False,
+                    use_alignment_tuning=self.use_alignment_tuning,
+                )
+                backbone_type = "PE (Perception Encoder)"
             else:
-                from ..inference.trt_runtime import TRTInferenceEngine
-                self.encoder = TRTInferenceEngine(path, device=self.device)
+                # Load standard model
+                from sam3.model_builder import build_sam3_hiera_l
 
-            logger.info(f"Encoder loaded: {path}")
+                logger.info(f"Loading SAM3 model from {self.checkpoint_path}...")
+                self.model = build_sam3_hiera_l(
+                    checkpoint_path=self.checkpoint_path,
+                    device=self.device,
+                    eval_mode=True,
+                    load_from_HF=False,
+                )
+                backbone_type = "ViT (standard)"
+
+            self.processor = Sam3Processor(
+                self.model,
+                resolution=self.resolution,
+                device=self.device,
+                confidence_threshold=0.5
+            )
+
+            logger.info(f"SAM3 model loaded successfully with {backbone_type} backbone")
+            return True
+
         except Exception as e:
-            logger.error(f"Failed to load encoder: {e}")
-            raise
+            logger.error(f"Failed to load SAM3 model: {e}")
+            self.stats['errors'] += 1
+            return False
 
-    def _load_decoder(self, path: str) -> None:
-        """Load decoder TRT engine."""
-        try:
-            import torch
-            torch.cuda.set_device(self.device)
-
-            from ..inference.trt_runtime import TRTInferenceEngine
-            self.decoder = TRTInferenceEngine(path, device=self.device)
-            logger.info(f"Decoder loaded: {path}")
-        except Exception as e:
-            logger.error(f"Failed to load decoder: {e}")
-            raise
-
-    def encode_image(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
+    def segment_with_text(self, image: np.ndarray, text_prompt: str) -> Dict:
         """
-        Encode image to embeddings.
+        Segment image using text prompt via SAM3's native VETextEncoder.
 
         Args:
-            image: Input image (H, W, 3) RGB uint8
+            image: RGB image as numpy array (H, W, 3)
+            text_prompt: Text description of object to segment
 
         Returns:
-            Tuple of (embeddings, inference_time_ms)
+            Dict with masks, boxes, scores
         """
         import torch
-        import torch.nn.functional as F
+        from PIL import Image
 
-        if self.encoder is None:
-            raise RuntimeError("Encoder not loaded")
+        if self.processor is None:
+            raise RuntimeError("Model not loaded")
 
         self.stats['total_requests'] += 1
-        self.stats['encode_requests'] += 1
-
+        self.stats['text_requests'] += 1
         start = time.perf_counter()
 
         try:
-            # Preprocess image
-            img_tensor = torch.from_numpy(image).float()
-            img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
-            img_tensor = img_tensor / 255.0
+            # Convert numpy to PIL for processor
+            pil_image = Image.fromarray(image)
 
-            # Resize to model input size (1008x1008)
-            img_tensor = F.interpolate(
-                img_tensor, size=(1008, 1008), mode='bilinear', align_corners=False
-            )
-
-            img_tensor = img_tensor.to(f'cuda:{self.device}')
-
-            # Run encoder
-            embeddings = self.encoder(img_tensor)
-
-            # Cache for subsequent decode calls
-            self._cached_embeddings = embeddings
-            self._cached_image_shape = image.shape[:2]
+            # SAM3 native text processing
+            state = self.processor.set_image(pil_image)
+            state = self.processor.set_text_prompt(text_prompt, state)
 
             elapsed_ms = (time.perf_counter() - start) * 1000
-            self.stats['encode_times'].append(elapsed_ms)
+            self.stats['inference_times'].append(elapsed_ms)
 
-            return embeddings.cpu().numpy(), elapsed_ms
+            # Extract results
+            masks = state.get("masks", torch.zeros(0, 1, image.shape[0], image.shape[1]))
+            boxes = state.get("boxes", torch.zeros(0, 4))
+            scores = state.get("scores", torch.zeros(0))
+
+            return {
+                "masks": masks.cpu().numpy() if torch.is_tensor(masks) else masks,
+                "boxes": boxes.cpu().numpy() if torch.is_tensor(boxes) else boxes,
+                "scores": scores.cpu().numpy() if torch.is_tensor(scores) else scores,
+                "inference_time_ms": elapsed_ms,
+            }
 
         except Exception as e:
             self.stats['errors'] += 1
-            logger.error(f"Encode error: {e}")
+            logger.error(f"Segmentation error: {e}")
             raise
 
-    def decode_masks(
+    def segment_with_point(
         self,
-        points: Optional[List[Tuple[float, float, int]]] = None,
-        boxes: Optional[List[Tuple[float, float, float, float]]] = None,
-        mask_input: Optional[np.ndarray] = None,
-        embeddings: Optional[np.ndarray] = None,
-    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        image: np.ndarray,
+        points: List[Tuple[float, float, int]]
+    ) -> Dict:
         """
-        Decode masks from prompts.
+        Segment image using point prompts.
 
         Args:
-            points: List of (x, y, label) tuples
-            boxes: List of (x1, y1, x2, y2) tuples
-            mask_input: Optional previous mask
-            embeddings: Optional embeddings (uses cached if not provided)
+            image: RGB image as numpy array (H, W, 3)
+            points: List of (x, y, label) where x,y are 0-1 normalized, label is 1=fg/0=bg
 
         Returns:
-            Tuple of (masks, iou_predictions, inference_time_ms)
+            Dict with masks, boxes, scores
         """
         import torch
+        from PIL import Image
 
-        if self.decoder is None:
-            raise RuntimeError("Decoder not loaded")
+        if self.processor is None:
+            raise RuntimeError("Model not loaded")
 
         self.stats['total_requests'] += 1
-        self.stats['decode_requests'] += 1
-
+        self.stats['point_requests'] += 1
         start = time.perf_counter()
 
         try:
-            # Get embeddings
-            if embeddings is not None:
-                emb_tensor = torch.from_numpy(embeddings).to(f'cuda:{self.device}')
-            elif self._cached_embeddings is not None:
-                emb_tensor = self._cached_embeddings
-            else:
-                raise ValueError("No embeddings provided and none cached")
+            pil_image = Image.fromarray(image)
+            h, w = image.shape[:2]
 
-            # Build sparse prompts from points/boxes
-            sparse_prompts = self._build_sparse_prompts(points, boxes)
+            # Set image first
+            state = self.processor.set_image(pil_image)
 
-            # Build dense prompts from mask input
-            if mask_input is not None:
-                dense_prompts = torch.from_numpy(mask_input).to(f'cuda:{self.device}')
-            else:
-                # Zero dense prompts
-                B, C, H, W = emb_tensor.shape
-                dense_prompts = torch.zeros(1, C, H, W, device=emb_tensor.device)
-
-            # Create positional encoding (simplified)
-            B, C, H, W = emb_tensor.shape
-            image_pe = torch.zeros(1, C, H, W, device=emb_tensor.device)
-
-            # Run decoder
-            outputs = self.decoder.infer(
-                image_embeddings=emb_tensor,
-                image_pe=image_pe,
-                sparse_prompt_embeddings=sparse_prompts,
-                dense_prompt_embeddings=dense_prompts,
-            )
-
-            masks = outputs.get('masks', outputs.get(list(outputs.keys())[0]))
-            iou_pred = outputs.get('iou_predictions', outputs.get(list(outputs.keys())[-1]))
-
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            self.stats['decode_times'].append(elapsed_ms)
-
-            return masks.cpu().numpy(), iou_pred.cpu().numpy(), elapsed_ms
-
-        except Exception as e:
-            self.stats['errors'] += 1
-            logger.error(f"Decode error: {e}")
-            raise
-
-    def _build_sparse_prompts(
-        self,
-        points: Optional[List[Tuple[float, float, int]]],
-        boxes: Optional[List[Tuple[float, float, float, float]]],
-    ):
-        """Build sparse prompt tensor from points and boxes."""
-        import torch
-
-        prompts = []
-        dim = 256  # Transformer dim
-
-        if points:
+            # Add points as box prompts (point → small box)
+            # SAM3 uses center_x, center_y, width, height format (normalized 0-1)
             for x, y, label in points:
-                # Simple positional encoding
-                prompt = torch.zeros(dim)
-                prompt[0] = x
-                prompt[1] = y
-                prompt[2] = label
-                prompts.append(prompt)
+                # Convert point to small box (5% of image size)
+                box_size = 0.05
+                box = [x, y, box_size, box_size]  # cx, cy, w, h
+                state = self.processor.add_geometric_prompt(box, label == 1, state)
 
-        if boxes:
-            for x1, y1, x2, y2 in boxes:
-                prompt = torch.zeros(dim)
-                prompt[0] = x1
-                prompt[1] = y1
-                prompt[2] = x2
-                prompt[3] = y2
-                prompt[4] = 2  # Box indicator
-                prompts.append(prompt)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            self.stats['inference_times'].append(elapsed_ms)
 
-        if not prompts:
-            # Default single point at center
-            prompt = torch.zeros(dim)
-            prompt[0] = 0.5
-            prompt[1] = 0.5
-            prompt[2] = 1
-            prompts.append(prompt)
+            masks = state.get("masks", torch.zeros(0, 1, h, w))
+            boxes = state.get("boxes", torch.zeros(0, 4))
+            scores = state.get("scores", torch.zeros(0))
 
-        sparse = torch.stack(prompts).unsqueeze(0)  # (1, N, dim)
-        return sparse.to(f'cuda:{self.device}')
+            return {
+                "masks": masks.cpu().numpy() if torch.is_tensor(masks) else masks,
+                "boxes": boxes.cpu().numpy() if torch.is_tensor(boxes) else boxes,
+                "scores": scores.cpu().numpy() if torch.is_tensor(scores) else scores,
+                "inference_time_ms": elapsed_ms,
+            }
+
+        except Exception as e:
+            self.stats['errors'] += 1
+            logger.error(f"Point segmentation error: {e}")
+            raise
 
     def get_stats(self) -> Dict:
         """Get inference statistics."""
-        encode_times = self.stats['encode_times'][-100:]  # Last 100
-        decode_times = self.stats['decode_times'][-100:]
-
+        times = self.stats['inference_times'][-100:]
         return {
             'total_requests': self.stats['total_requests'],
-            'encode_requests': self.stats['encode_requests'],
-            'decode_requests': self.stats['decode_requests'],
-            'avg_encode_time_ms': sum(encode_times) / max(1, len(encode_times)),
-            'avg_decode_time_ms': sum(decode_times) / max(1, len(decode_times)),
+            'text_requests': self.stats['text_requests'],
+            'point_requests': self.stats['point_requests'],
+            'avg_inference_time_ms': sum(times) / max(1, len(times)),
             'errors': self.stats['errors'],
         }
-
-    def clear_cache(self) -> None:
-        """Clear cached embeddings."""
-        self._cached_embeddings = None
-        self._cached_image_shape = None
 
 
 # ============================================================================
@@ -373,45 +301,45 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     global _runtime, _startup_time
 
-    logger.info("Starting SAM3 FastAPI server...")
+    logger.info("Starting SAM3 API Server...")
     _startup_time = time.time()
 
-    # Get engine paths from environment
-    encoder_path = os.environ.get(
-        'SAM3_ENCODER_ENGINE',
-        '/workspace/sam3_deepstream/engines/sam3_encoder.engine'
+    # Get checkpoint path from environment
+    checkpoint_path = os.environ.get(
+        'SAM3_CHECKPOINT',
+        '/workspace/checkpoints/sam3.pt'
     )
-    decoder_path = os.environ.get(
-        'SAM3_DECODER_ENGINE',
-        '/workspace/sam3_deepstream/engines/sam3_decoder.engine'
-    )
-    device = int(os.environ.get('CUDA_DEVICE', '0'))
-    use_async = os.environ.get('USE_ASYNC', 'true').lower() == 'true'
+    # Use "cuda" for device - SAM3 builder only supports "cuda" or "cpu"
+    # For multi-GPU, use CUDA_VISIBLE_DEVICES environment variable
+    device = "cuda" if os.environ.get('CUDA_DEVICE', '0') != '-1' else "cpu"
 
     # Initialize runtime
-    try:
-        _runtime = InferenceRuntime(
-            encoder_path=encoder_path if Path(encoder_path).exists() else None,
-            decoder_path=decoder_path if Path(decoder_path).exists() else None,
-            device=device,
-            use_async=use_async,
-        )
-        logger.info("Inference runtime initialized")
-    except Exception as e:
-        logger.warning(f"Could not initialize full runtime: {e}")
-        _runtime = InferenceRuntime(device=device, use_async=use_async)
+    _runtime = SAM3Runtime(checkpoint_path=checkpoint_path, device=device)
+
+    # Try to load model
+    if Path(checkpoint_path).exists():
+        try:
+            _runtime.load_model()
+        except Exception as e:
+            logger.warning(f"Could not load model on startup: {e}")
+    else:
+        logger.warning(f"Checkpoint not found: {checkpoint_path}")
+        logger.info("Server will start in degraded mode. Provide checkpoint to enable inference.")
+
+    # Create upload directory
+    upload_dir = Path("/workspace/uploads")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    app.state.upload_dir = upload_dir
 
     yield
 
     # Cleanup
-    logger.info("Shutting down SAM3 FastAPI server...")
-    if _runtime:
-        _runtime.clear_cache()
+    logger.info("Shutting down SAM3 API Server...")
 
 
 app = FastAPI(
     title="SAM3 Inference API",
-    description="TensorRT-accelerated SAM3 segmentation inference API",
+    description="SAM3 segmentation with native text prompt support via VETextEncoder",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -427,7 +355,7 @@ app.add_middleware(
 
 
 # ============================================================================
-# API Endpoints
+# Endpoints
 # ============================================================================
 
 @app.get("/health", response_model=HealthResponse)
@@ -449,16 +377,18 @@ async def health_check():
         pass
 
     uptime = time.time() - _startup_time if _startup_time else 0
+    model_loaded = _runtime is not None and _runtime.processor is not None
+    backbone_type = _runtime.stats.get('backbone_type', 'unknown') if _runtime else None
 
     return HealthResponse(
-        status="healthy" if _runtime else "degraded",
-        encoder_loaded=_runtime.encoder is not None if _runtime else False,
-        decoder_loaded=_runtime.decoder is not None if _runtime else False,
+        status="healthy" if model_loaded else "degraded",
+        model_loaded=model_loaded,
         uptime_seconds=uptime,
         gpu_available=gpu_available,
         gpu_name=gpu_name,
         gpu_memory_used_mb=gpu_memory_used,
         gpu_memory_total_mb=gpu_memory_total,
+        backbone_type=backbone_type,
     )
 
 
@@ -472,194 +402,97 @@ async def get_stats():
     return InferenceStats(**stats)
 
 
-@app.post("/encode", response_model=EncodeResponse)
-async def encode_image(
-    file: Optional[UploadFile] = File(None),
-    request: Optional[EncodeRequest] = None,
-):
-    """
-    Encode image to embeddings.
-
-    Upload an image file or provide base64-encoded image data.
-    """
-    if not _runtime or not _runtime.encoder:
-        raise HTTPException(status_code=503, detail="Encoder not loaded")
-
-    try:
-        from PIL import Image
-
-        # Get image data
-        if file:
-            image_data = await file.read()
-            image = Image.open(io.BytesIO(image_data)).convert('RGB')
-        elif request and request.image_base64:
-            image_data = base64.b64decode(request.image_base64)
-            image = Image.open(io.BytesIO(image_data)).convert('RGB')
-        else:
-            raise HTTPException(status_code=400, detail="No image provided")
-
-        # Convert to numpy
-        image_np = np.array(image)
-
-        # Run encoding
-        embeddings, inference_time = await asyncio.get_event_loop().run_in_executor(
-            None, _runtime.encode_image, image_np
-        )
-
-        response = EncodeResponse(
-            success=True,
-            embedding_shape=list(embeddings.shape),
-            inference_time_ms=inference_time,
-        )
-
-        # Optionally return embeddings
-        if request and request.return_embeddings:
-            emb_bytes = embeddings.astype(np.float16).tobytes()
-            response.embeddings_base64 = base64.b64encode(emb_bytes).decode()
-
-        return response
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Encode error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/decode", response_model=DecodeResponse)
-async def decode_masks(request: DecodeRequest):
-    """
-    Decode masks from prompts.
-
-    Requires prior call to /encode or cached embeddings.
-    """
-    if not _runtime or not _runtime.decoder:
-        raise HTTPException(status_code=503, detail="Decoder not loaded")
-
-    if _runtime._cached_embeddings is None:
-        raise HTTPException(
-            status_code=400,
-            detail="No cached embeddings. Call /encode first."
-        )
-
-    try:
-        # Convert prompts
-        points = None
-        if request.points:
-            points = [(p.x, p.y, p.label) for p in request.points]
-
-        boxes = None
-        if request.boxes:
-            boxes = [(b.x1, b.y1, b.x2, b.y2) for b in request.boxes]
-
-        # Decode mask input if provided
-        mask_input = None
-        if request.mask_input:
-            mask_bytes = base64.b64decode(request.mask_input)
-            mask_input = np.frombuffer(mask_bytes, dtype=np.float32)
-
-        # Run decoding
-        masks, iou_pred, inference_time = await asyncio.get_event_loop().run_in_executor(
-            None, _runtime.decode_masks, points, boxes, mask_input, None
-        )
-
-        # Encode masks as base64
-        mask_bytes = masks.astype(np.float16).tobytes()
-        masks_base64 = base64.b64encode(mask_bytes).decode()
-
-        return DecodeResponse(
-            success=True,
-            num_masks=masks.shape[1],
-            mask_shape=list(masks.shape),
-            iou_predictions=iou_pred.flatten().tolist(),
-            inference_time_ms=inference_time,
-            masks_base64=masks_base64,
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Decode error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/segment")
-async def segment_image(
+@app.post("/api/v1/segment")
+async def segment_with_text(
     file: UploadFile = File(...),
-    points: Optional[str] = Query(None, description="Points as 'x1,y1,l1;x2,y2,l2'"),
-    boxes: Optional[str] = Query(None, description="Boxes as 'x1,y1,x2,y2;...'"),
-    return_mask_image: bool = Query(True, description="Return mask as PNG image"),
+    text_prompt: str = Form(..., description="Text description of object to segment"),
+    confidence_threshold: float = Form(0.5, description="Minimum confidence 0-1"),
+    return_json: bool = Form(False, description="Return JSON instead of image"),
 ):
     """
-    One-shot segmentation: encode image and decode masks in single request.
+    Segment objects using text prompt (SAM3 native VETextEncoder).
 
-    Returns mask overlay as PNG image or JSON with base64 data.
+    Example:
+        curl -X POST http://localhost:8000/api/v1/segment \\
+          -F "file=@image.jpg" \\
+          -F "text_prompt=red car" \\
+          --output result.png
     """
-    if not _runtime:
-        raise HTTPException(status_code=503, detail="Runtime not initialized")
+    if not _runtime or not _runtime.processor:
+        raise HTTPException(status_code=503, detail="Model not loaded")
 
     try:
         from PIL import Image
+        import cv2
 
         # Load image
         image_data = await file.read()
         image = Image.open(io.BytesIO(image_data)).convert('RGB')
         image_np = np.array(image)
+        h, w = image_np.shape[:2]
 
-        # Parse prompts
-        point_list = None
-        if points:
-            point_list = []
-            for p in points.split(';'):
-                parts = p.split(',')
-                if len(parts) >= 2:
-                    x, y = float(parts[0]), float(parts[1])
-                    label = int(parts[2]) if len(parts) > 2 else 1
-                    point_list.append((x, y, label))
+        # Set confidence threshold
+        _runtime.processor.confidence_threshold = confidence_threshold
 
-        box_list = None
-        if boxes:
-            box_list = []
-            for b in boxes.split(';'):
-                parts = b.split(',')
-                if len(parts) >= 4:
-                    box_list.append(tuple(float(x) for x in parts[:4]))
-
-        # Encode
-        embeddings, encode_time = await asyncio.get_event_loop().run_in_executor(
-            None, _runtime.encode_image, image_np
+        # Run SAM3 native text segmentation
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, _runtime.segment_with_text, image_np, text_prompt
         )
 
-        # Decode
-        masks, iou_pred, decode_time = await asyncio.get_event_loop().run_in_executor(
-            None, _runtime.decode_masks, point_list, box_list, None, None
-        )
+        masks = result["masks"]
+        boxes = result["boxes"]
+        scores = result["scores"]
+        inference_time = result["inference_time_ms"]
 
-        total_time = encode_time + decode_time
+        num_detections = len(scores) if hasattr(scores, '__len__') else 0
 
-        if return_mask_image:
-            # Create mask overlay
-            import cv2
+        if return_json:
+            # Return JSON response
+            detections = []
+            for i in range(num_detections):
+                mask_area = int(masks[i].sum()) if i < len(masks) else 0
+                detections.append(DetectionResult(
+                    bbox=boxes[i].tolist() if i < len(boxes) else [0, 0, 0, 0],
+                    score=float(scores[i]) if i < len(scores) else 0.0,
+                    mask_area=mask_area,
+                ))
 
-            # Use best mask (highest IoU)
-            best_idx = np.argmax(iou_pred)
-            mask = masks[0, best_idx]
-
-            # Resize mask to image size
-            mask_resized = cv2.resize(
-                mask, (image_np.shape[1], image_np.shape[0]),
-                interpolation=cv2.INTER_LINEAR
+            return SegmentResponse(
+                success=True,
+                inference_time_ms=inference_time,
+                num_detections=num_detections,
+                detections=detections,
             )
-
-            # Apply sigmoid and threshold
-            mask_binary = (1 / (1 + np.exp(-mask_resized))) > 0.5
-
-            # Create colored overlay
+        else:
+            # Create mask overlay image
             overlay = image_np.copy()
-            overlay[mask_binary] = overlay[mask_binary] * 0.5 + np.array([0, 255, 0]) * 0.5
 
-            # Convert to PNG
-            result_image = Image.fromarray(overlay.astype(np.uint8))
+            if num_detections > 0:
+                # Combine all masks
+                combined_mask = np.zeros((h, w), dtype=bool)
+                for i in range(num_detections):
+                    if i < len(masks):
+                        mask = masks[i].squeeze()
+                        if mask.shape != (h, w):
+                            mask = cv2.resize(mask.astype(np.float32), (w, h)) > 0.5
+                        combined_mask |= mask
+
+                # Apply green overlay
+                overlay[combined_mask] = (
+                    overlay[combined_mask] * 0.5 + np.array([0, 255, 0]) * 0.5
+                ).astype(np.uint8)
+
+                # Draw bounding boxes
+                for i in range(min(num_detections, len(boxes))):
+                    box = boxes[i].astype(int)
+                    cv2.rectangle(overlay, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+                    if i < len(scores):
+                        label = f"{text_prompt}: {scores[i]:.2f}"
+                        cv2.putText(overlay, label, (box[0], box[1] - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            # Return as PNG
+            result_image = Image.fromarray(overlay)
             img_buffer = io.BytesIO()
             result_image.save(img_buffer, format='PNG')
             img_buffer.seek(0)
@@ -668,34 +501,130 @@ async def segment_image(
                 img_buffer,
                 media_type="image/png",
                 headers={
-                    "X-Inference-Time-Ms": str(total_time),
-                    "X-IoU-Score": str(iou_pred[0, best_idx]),
+                    "X-Inference-Time-Ms": str(inference_time),
+                    "X-Num-Detections": str(num_detections),
+                    "X-Text-Prompt": text_prompt,
                 }
             )
-        else:
-            # Return JSON
-            mask_bytes = masks.astype(np.float16).tobytes()
-            return JSONResponse({
-                "success": True,
-                "encode_time_ms": encode_time,
-                "decode_time_ms": decode_time,
-                "total_time_ms": total_time,
-                "iou_predictions": iou_pred.flatten().tolist(),
-                "mask_shape": list(masks.shape),
-                "masks_base64": base64.b64encode(mask_bytes).decode(),
-            })
 
     except Exception as e:
         logger.error(f"Segment error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/clear-cache")
-async def clear_cache():
-    """Clear cached embeddings."""
-    if _runtime:
-        _runtime.clear_cache()
-    return {"status": "cache cleared"}
+@app.post("/segment")
+async def segment_with_point(
+    file: UploadFile = File(...),
+    points: Optional[str] = Query(None, description="Points as 'x1,y1,l1;x2,y2,l2' (coords 0-1)"),
+    boxes: Optional[str] = Query(None, description="Boxes as 'x1,y1,x2,y2;...' (coords 0-1)"),
+    return_json: bool = Query(False, description="Return JSON instead of image"),
+):
+    """
+    Segment image with point or box prompts.
+
+    Coordinates are normalized 0-1 (relative to image dimensions).
+
+    Examples:
+        - Point at center: points=0.5,0.5,1
+        - Box around object: boxes=0.2,0.2,0.8,0.8
+    """
+    if not _runtime or not _runtime.processor:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    try:
+        from PIL import Image
+        import cv2
+
+        # Load image
+        image_data = await file.read()
+        image = Image.open(io.BytesIO(image_data)).convert('RGB')
+        image_np = np.array(image)
+        h, w = image_np.shape[:2]
+
+        # Parse prompts
+        point_list = []
+        if points:
+            for p in points.split(';'):
+                parts = p.strip().split(',')
+                if len(parts) >= 2:
+                    x, y = float(parts[0]), float(parts[1])
+                    label = int(parts[2]) if len(parts) > 2 else 1
+                    point_list.append((x, y, label))
+
+        if not point_list:
+            # Default: center point
+            point_list = [(0.5, 0.5, 1)]
+
+        # Run segmentation
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, _runtime.segment_with_point, image_np, point_list
+        )
+
+        masks = result["masks"]
+        result_boxes = result["boxes"]
+        scores = result["scores"]
+        inference_time = result["inference_time_ms"]
+
+        num_detections = len(scores) if hasattr(scores, '__len__') else 0
+
+        if return_json:
+            detections = []
+            for i in range(num_detections):
+                mask_area = int(masks[i].sum()) if i < len(masks) else 0
+                detections.append(DetectionResult(
+                    bbox=result_boxes[i].tolist() if i < len(result_boxes) else [0, 0, 0, 0],
+                    score=float(scores[i]) if i < len(scores) else 0.0,
+                    mask_area=mask_area,
+                ))
+
+            return SegmentResponse(
+                success=True,
+                inference_time_ms=inference_time,
+                num_detections=num_detections,
+                detections=detections,
+            )
+        else:
+            # Create mask overlay
+            overlay = image_np.copy()
+
+            if num_detections > 0:
+                combined_mask = np.zeros((h, w), dtype=bool)
+                for i in range(num_detections):
+                    if i < len(masks):
+                        mask = masks[i].squeeze()
+                        if mask.shape != (h, w):
+                            mask = cv2.resize(mask.astype(np.float32), (w, h)) > 0.5
+                        combined_mask |= mask
+
+                overlay[combined_mask] = (
+                    overlay[combined_mask] * 0.5 + np.array([0, 255, 0]) * 0.5
+                ).astype(np.uint8)
+
+            # Draw input points
+            for x, y, label in point_list:
+                px, py = int(x * w), int(y * h)
+                color = (0, 255, 0) if label == 1 else (255, 0, 0)
+                cv2.circle(overlay, (px, py), 10, color, -1)
+                cv2.circle(overlay, (px, py), 12, (255, 255, 255), 2)
+
+            # Return as PNG
+            result_image = Image.fromarray(overlay)
+            img_buffer = io.BytesIO()
+            result_image.save(img_buffer, format='PNG')
+            img_buffer.seek(0)
+
+            return StreamingResponse(
+                img_buffer,
+                media_type="image/png",
+                headers={
+                    "X-Inference-Time-Ms": str(inference_time),
+                    "X-Num-Detections": str(num_detections),
+                }
+            )
+
+    except Exception as e:
+        logger.error(f"Point segment error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================================
@@ -708,13 +637,12 @@ def main():
 
     host = os.environ.get('HOST', '0.0.0.0')
     port = int(os.environ.get('PORT', '8000'))
-    workers = int(os.environ.get('WORKERS', '1'))
 
     uvicorn.run(
         "sam3_deepstream.api.server:app",
         host=host,
         port=port,
-        workers=workers,
+        workers=1,  # Single worker for GPU
         log_level="info",
     )
 

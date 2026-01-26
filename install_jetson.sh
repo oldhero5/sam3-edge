@@ -333,71 +333,71 @@ if [ "$DOCKER_ONLY" = false ]; then
     # Install Python dependencies
     print_header "Installing Python Dependencies"
 
+    # Verify Jetson PyTorch is available before proceeding
+    if python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'" 2>/dev/null; then
+        TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
+        print_success "Jetson PyTorch with CUDA detected: $TORCH_VERSION"
+    else
+        print_error "System PyTorch with CUDA not found"
+        print_info "Install PyTorch for Jetson: https://docs.nvidia.com/deeplearning/frameworks/install-pytorch-jetson-platform/"
+        exit 1
+    fi
+
+    # Verify torchvision is available
+    if python3 -c "import torchvision" 2>/dev/null; then
+        TV_VERSION=$(python3 -c "import torchvision; print(torchvision.__version__)")
+        print_success "Jetson torchvision detected: $TV_VERSION"
+    else
+        print_error "torchvision not found in system packages"
+        print_info ""
+        print_info "On Jetson, torchvision must be installed from NVIDIA's wheel server."
+        print_info "DO NOT use 'pip install torchvision' - it will break your CUDA PyTorch!"
+        print_info ""
+        print_info "Run these commands manually:"
+        echo ""
+        echo "  sudo pip3 install --no-cache-dir torch==2.8.0 torchvision==0.23.0 \\"
+        echo "      --index-url=https://pypi.jetson-ai-lab.io/jp6/cu126"
+        echo ""
+        print_info "Then re-run this script."
+        exit 1
+    fi
+
+    # Double-check that PyTorch still has CUDA after torchvision import
+    # (This catches the case where a broken torchvision pulled in CPU-only torch)
+    if ! python3 -c "import torch; import torchvision; assert torch.cuda.is_available(), 'CUDA broken'" 2>/dev/null; then
+        print_error "PyTorch CUDA is broken after loading torchvision!"
+        print_info "This usually means a CPU-only torch was installed from PyPI."
+        print_info ""
+        print_info "Fix with:"
+        echo ""
+        echo "  sudo pip3 uninstall -y torch torchvision"
+        echo "  sudo pip3 install --no-cache-dir torch==2.8.0 torchvision==0.23.0 \\"
+        echo "      --index-url=https://pypi.jetson-ai-lab.io/jp6/cu126"
+        echo ""
+        exit 1
+    fi
+
+    print_info "Creating virtual environment with system site packages..."
+    # Use system-site-packages to inherit Jetson's PyTorch with CUDA
+    uv venv --system-site-packages
+
     print_info "Syncing workspace dependencies..."
-    uv sync
+    # Skip torch/torchvision/triton - Jetson uses NVIDIA's pre-built PyTorch from JetPack
+    uv sync --package sam3-deepstream --no-install-package torch --no-install-package torchvision --no-install-package triton
     print_success "Python dependencies installed"
 
-    # Initialize database
-    print_header "Initializing Database"
+    # Create directories for database and engines
+    print_header "Preparing Directories"
 
     mkdir -p "$DB_DIR"
     mkdir -p "$ENGINE_DIR"
 
-    print_info "Creating SQLite database and FAISS index..."
-
-    uv run python3 << EOF
-import sys
-from pathlib import Path
-
-# Add the package to path
-sys.path.insert(0, '.')
-
-try:
-    from sam3_deepstream.api.services.detection_store import DetectionStore
-    import asyncio
-
-    async def init():
-        store = DetectionStore(
-            db_path=Path("$DB_DIR/detections.db"),
-            index_path=Path("$DB_DIR/embeddings.index"),
-            use_gpu=True
-        )
-        await store.initialize()
-        print("Database initialized successfully")
-
-    asyncio.run(init())
-except ImportError as e:
-    print(f"Warning: Could not initialize database (will be created on first run): {e}")
-EOF
-
-    print_success "Database directory initialized at $DB_DIR"
-
-    # Export TensorRT engines if checkpoint provided
-    if [ -n "$CHECKPOINT_PATH" ]; then
-        print_header "Exporting TensorRT Engines"
-
-        if [ ! -f "$CHECKPOINT_PATH" ]; then
-            print_error "Checkpoint not found: $CHECKPOINT_PATH"
-            exit 1
-        fi
-
-        print_info "Exporting engines from: $CHECKPOINT_PATH"
-        print_info "Output directory: $ENGINE_DIR"
-        print_info "Precision: $PRECISION"
-
-        uv run python -m sam3_deepstream.scripts.export_engines \
-            --checkpoint "$CHECKPOINT_PATH" \
-            --output-dir "$ENGINE_DIR" \
-            --precision "$PRECISION"
-
-        print_success "TensorRT engines exported to $ENGINE_DIR"
-    else
-        print_info "No checkpoint provided, skipping TensorRT export"
-        print_info "To export later: ./install_jetson.sh --checkpoint /path/to/sam3.pt"
-    fi
+    print_success "Database directory: $DB_DIR"
+    print_success "Engine directory: $ENGINE_DIR"
+    print_info "Database will be initialized on first API request"
 fi
 
-# Build Docker image
+# Build Docker image FIRST (needed for TRT export to match container's TRT version)
 if [ "$SKIP_DOCKER" = false ]; then
     print_header "Building Docker Image"
 
@@ -414,6 +414,145 @@ if [ "$SKIP_DOCKER" = false ]; then
     print_success "Tagged as: sam3-edge:jetson-$VERSION"
 
     cd ..
+fi
+
+# Export TensorRT engines INSIDE Docker container
+# This ensures TRT version matches the runtime environment
+if [ "$DOCKER_ONLY" = false ]; then
+    print_header "Exporting TensorRT Engines (inside Docker)"
+
+    # Check if engines already exist
+    ENCODER_ENGINE="$ENGINE_DIR/sam3_encoder.engine"
+    DECODER_ENGINE="$ENGINE_DIR/sam3_decoder.engine"
+
+    if [ -f "$ENCODER_ENGINE" ] && [ -f "$DECODER_ENGINE" ]; then
+        print_success "TensorRT engines already exist at $ENGINE_DIR"
+        print_info "To re-export, delete existing engines and run again"
+    else
+        # If no checkpoint provided, search common locations
+        if [ -z "$CHECKPOINT_PATH" ]; then
+            print_info "Searching for SAM3 checkpoint..."
+
+            # Check common locations for SAM3 checkpoint
+            SEARCH_PATHS=(
+                "./sam3/checkpoints/sam3.pt"
+                "$HOME/.cache/sam3/checkpoints/sam3.pt"
+                "$HOME/.cache/sam3_deepstream/checkpoints/sam3.pt"
+                "./checkpoints/sam3.pt"
+                "../checkpoints/sam3.pt"
+            )
+
+            for path in "${SEARCH_PATHS[@]}"; do
+                if [ -f "$path" ]; then
+                    CHECKPOINT_PATH="$(realpath "$path")"
+                    print_success "Found SAM3 checkpoint: $CHECKPOINT_PATH"
+                    break
+                fi
+            done
+        fi
+
+        # If still no checkpoint, try to download from HuggingFace with authentication
+        if [ -z "$CHECKPOINT_PATH" ] || [ ! -f "$CHECKPOINT_PATH" ]; then
+            print_info "SAM3 checkpoint not found locally, attempting HuggingFace download..."
+            CHECKPOINT_PATH="$HOME/.cache/sam3_deepstream/checkpoints/sam3.pt"
+            mkdir -p "$(dirname "$CHECKPOINT_PATH")"
+
+            # Download checkpoint using huggingface_hub with authentication
+            uv run python << 'EOF'
+import os
+import sys
+
+checkpoint_path = os.path.expanduser("~/.cache/sam3_deepstream/checkpoints/sam3.pt")
+
+if os.path.exists(checkpoint_path):
+    print(f"Checkpoint already exists: {checkpoint_path}")
+    sys.exit(0)
+
+# Check for HF token
+hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+if not hf_token:
+    # Try to get from huggingface-cli login
+    try:
+        from huggingface_hub import HfFolder
+        hf_token = HfFolder.get_token()
+    except:
+        pass
+
+if not hf_token:
+    print("ERROR: HuggingFace authentication required for SAM3 model download.")
+    print("Please either:")
+    print("  1. Run: huggingface-cli login")
+    print("  2. Set HF_TOKEN environment variable")
+    print("  3. Provide checkpoint manually: --checkpoint /path/to/sam3.pt")
+    sys.exit(1)
+
+print("Downloading SAM3 checkpoint from HuggingFace (authenticated)...")
+try:
+    from huggingface_hub import hf_hub_download
+
+    # Download SAM3 model (adjust repo_id to actual SAM3 repo)
+    downloaded = hf_hub_download(
+        repo_id="facebook/sam3-hiera-large",  # SAM3 repo
+        filename="sam3_hiera_large.pt",
+        local_dir=os.path.dirname(checkpoint_path),
+        token=hf_token
+    )
+    # Rename to expected name if different
+    if downloaded != checkpoint_path:
+        os.rename(downloaded, checkpoint_path)
+    print(f"Downloaded to: {checkpoint_path}")
+except Exception as e:
+    print(f"ERROR: Failed to download SAM3 checkpoint: {e}")
+    print("Please provide checkpoint manually: --checkpoint /path/to/sam3.pt")
+    sys.exit(1)
+EOF
+            if [ $? -ne 0 ]; then
+                print_error "Failed to obtain SAM3 checkpoint"
+                print_info "Please provide checkpoint manually: --checkpoint /path/to/sam3.pt"
+                exit 1
+            fi
+            print_success "SAM3 checkpoint ready"
+        fi
+
+        if [ ! -f "$CHECKPOINT_PATH" ]; then
+            print_error "Checkpoint not found: $CHECKPOINT_PATH"
+            exit 1
+        fi
+
+        print_info "Exporting engines from: $CHECKPOINT_PATH"
+        print_info "Output directory: $ENGINE_DIR"
+        print_info "Precision: $PRECISION"
+        print_info "Running TRT export inside Docker to match container TensorRT version..."
+
+        # Get the directory containing the checkpoint for mounting
+        CHECKPOINT_DIR="$(dirname "$CHECKPOINT_PATH")"
+        CHECKPOINT_NAME="$(basename "$CHECKPOINT_PATH")"
+
+        # Run export inside Docker container with GPU access
+        # PYTHONPATH includes both /workspace and /workspace/sam3 for sam3 package
+        docker run --rm \
+            --runtime nvidia \
+            --gpus all \
+            -v "$CHECKPOINT_DIR:/workspace/checkpoints:ro" \
+            -v "$ENGINE_DIR:/workspace/engines" \
+            -v "$(pwd)/sam3:/workspace/sam3:ro" \
+            -v "$(pwd)/sam3_deepstream:/workspace/sam3_deepstream:ro" \
+            -e PYTHONPATH=/workspace:/workspace/sam3 \
+            sam3-edge:jetson \
+            python3 /workspace/sam3_deepstream/scripts/export_engines.py \
+                --checkpoint "/workspace/checkpoints/$CHECKPOINT_NAME" \
+                --output-dir /workspace/engines \
+                --precision "$PRECISION"
+
+        if [ $? -eq 0 ]; then
+            print_success "TensorRT engines exported to $ENGINE_DIR"
+            # Show TRT version used
+            print_info "Engines built with Docker's TensorRT version (compatible with runtime)"
+        else
+            print_error "Failed to export TensorRT engines"
+            exit 1
+        fi
+    fi
 fi
 
 # Push to DockerHub
@@ -453,30 +592,25 @@ echo "Quick Start:"
 echo "─────────────────────────────────────────────────────────────"
 echo ""
 echo "1. Start the API server with Docker:"
-echo "   ${CYAN}cd sam3_deepstream && docker compose -f docker-compose.jetson.yml up -d${NC}"
+echo -e "   ${CYAN}cd sam3_deepstream && docker compose -f docker-compose.jetson.yml up -d${NC}"
 echo ""
 echo "2. Check the health endpoint:"
-echo "   ${CYAN}curl http://localhost:8000/health${NC}"
+echo -e "   ${CYAN}curl http://localhost:8000/health${NC}"
 echo ""
 echo "3. Submit a text prompt detection:"
-echo "   ${CYAN}curl -X POST http://localhost:8000/api/v1/detect \\"
+echo -e "   ${CYAN}curl -X POST http://localhost:8000/api/v1/detect \\"
 echo "     -F 'file=@video.mp4' \\"
-echo "     -F 'text_prompt=green traffic lights'${NC}"
+echo -e "     -F 'text_prompt=green traffic lights'${NC}"
 echo ""
 echo "4. Search detected objects:"
-echo "   ${CYAN}curl 'http://localhost:8000/api/v1/search?q=traffic+light'${NC}"
+echo -e "   ${CYAN}curl 'http://localhost:8000/api/v1/search?q=traffic+light'${NC}"
 echo ""
 echo "5. List all detected objects:"
-echo "   ${CYAN}curl http://localhost:8000/api/v1/objects${NC}"
+echo -e "   ${CYAN}curl http://localhost:8000/api/v1/objects${NC}"
 echo ""
 
-if [ -z "$CHECKPOINT_PATH" ]; then
-    echo -e "${YELLOW}Note:${NC} TensorRT engines not exported."
-    echo "For optimal performance, export engines with:"
-    echo "   ${CYAN}./install_jetson.sh --checkpoint /path/to/sam3_checkpoint.pt${NC}"
-    echo ""
-fi
-
+echo -e "TensorRT engines location: ${CYAN}$ENGINE_DIR${NC}"
+echo ""
 echo "For more information, see README.md"
 echo ""
 print_success "Installation successful!"

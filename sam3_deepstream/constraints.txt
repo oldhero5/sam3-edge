@@ -1,0 +1,3 @@
+# Pin numpy<2 for PyTorch compatibility on Jetson
+# The base image (dustynv/l4t-pytorch) has PyTorch compiled with numpy 1.x
+numpy<2

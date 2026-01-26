@@ -1,20 +1,29 @@
-# SAM3 Inference API - Jetson Override
+# SAM3 Inference API - Jetson Configuration
 #
-# Use with docker-compose.yml:
-#   docker-compose -f docker-compose.yml -f docker-compose.jetson.yml up -d
-
-version: "3.8"
+# Uses SAM3's native VETextEncoder for text prompt support.
+# Optimized for Jetson AGX Orin with JetPack 6.x.
+#
+# Usage:
+#   docker compose -f docker-compose.jetson.yml up -d
+#
+# Test:
+#   curl http://localhost:8000/health
+#   curl -X POST http://localhost:8000/api/v1/segment \
+#     -F "file=@test.jpg" -F "text_prompt=red car" --output result.png
 
 services:
   sam3-api:
     build:
-      context: .
-      dockerfile: Dockerfile.jetson
-    image: sam3-api:jetson
+      context: ..
+      dockerfile: sam3_deepstream/Dockerfile.jetson
+    image: sam3-edge:jetson
 
-    # Jetson uses different runtime configuration
+    # Jetson runtime configuration
     runtime: nvidia
-    privileged: true  # Required for some Jetson features
+    privileged: true
+
+    ports:
+      - "8000:8000"
 
     environment:
       # Jetson-specific optimizations
@@ -24,40 +33,42 @@ services:
       - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
       # Use unified memory on Jetson
       - PYTORCH_CUDA_MEMORY_FRACTION=0.8
-      # Database configuration for NLQ
-      - SAM3_DB_PATH=/workspace/db/detections.db
-      - SAM3_FAISS_INDEX=/workspace/db/embeddings.index
-      - SAM3_USE_GPU_FAISS=true
+      # PE (Perception Encoder) configuration
+      # Set to 1 to use PE-enhanced backbone for improved text understanding
+      - SAM3_USE_PE_BACKBONE=${SAM3_USE_PE_BACKBONE:-0}
+      - SAM3_ALIGNMENT_TUNING=${SAM3_ALIGNMENT_TUNING:-1}
 
     volumes:
-      # Mount engines
-      - ./engines:/workspace/engines:ro
-      # Mount data
+      # Mount engines from cache directory (built by install_jetson.sh)
+      # Includes PE encoder engines when SAM3_USE_PE_BACKBONE=1
+      - ${HOME}/.cache/sam3_deepstream/engines:/workspace/engines:ro
+      # Mount SAM3 checkpoint for model loading
+      - ../sam3/checkpoints:/workspace/checkpoints:ro
+      # Mount data directory for uploads
       - ./data:/workspace/data
       # Cache CUDA kernels
       - sam3-cuda-cache:/workspace/.cuda_cache
-      # Persistent database storage for NLQ
-      - sam3-db:/workspace/db
+      # Mount test data for running tests
+      - ../test_data:/workspace/test_data:ro
+      # Optional: PE weights for fine-tuning (if using separate PE checkpoint)
+      # - ${HOME}/.cache/perception_encoder:/workspace/pe_weights:ro
 
-    # Jetson typically has less memory, adjust health check timing
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 15s
       retries: 5
-      start_period: 120s  # TRT engine loading can take time
+      start_period: 120s  # TRT engine loading takes time
 
-    # Memory limits for Jetson (adjust based on your model)
-    # AGX Orin has 32GB/64GB unified memory
+    # Memory limits for Jetson AGX Orin (32GB/64GB unified memory)
+    # PE backbone requires additional memory for alignment tuning layers
     deploy:
       resources:
         limits:
-          memory: 24g
+          memory: 28g  # Increased from 24g for PE backbone
         reservations:
-          memory: 8g
+          memory: 10g  # Increased from 8g for PE backbone
 
 volumes:
   sam3-cuda-cache:
-    driver: local
-  sam3-db:
     driver: local
