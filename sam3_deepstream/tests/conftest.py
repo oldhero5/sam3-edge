@@ -179,7 +179,7 @@ def engine_dir() -> Path:
     """
     # Check container path first, then local
     possible_paths = [
-        Path("/workspace/engines"),  # Container mount
+        Path("/workspace/sam3_deepstream/engines"),  # Container mount
         Path(__file__).parent.parent / "engines",  # Local
     ]
 

@@ -48,9 +48,11 @@ TEST_PATH="${1:-/workspace/sam3_deepstream/tests/}"
 shift 2>/dev/null || true
 
 # Run tests in Docker container
+# --network host allows container to reach API server on host's localhost:8000
 docker run --rm \
     --runtime nvidia \
     --gpus all \
+    --network host \
     -v "$PROJECT_ROOT/sam3:/workspace/sam3:ro" \
     -v "$PROJECT_ROOT/sam3_deepstream:/workspace/sam3_deepstream:ro" \
     -v "$PROJECT_ROOT/test_data:/workspace/test_data:ro" \

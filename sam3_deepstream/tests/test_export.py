@@ -107,10 +107,16 @@ class TestExportFunctions:
         assert callable(export_pe_text_encoder)
 
 
-@pytest.mark.skipif(
-    not Path("/mnt/repos/sam3_test/sam3_deepstream/engines").exists(),
-    reason="Engines directory not found"
-)
+def _engines_exist() -> bool:
+    """Check if engines directory exists (works in container or locally)."""
+    possible_paths = [
+        Path("/workspace/sam3_deepstream/engines"),  # Container path
+        Path(__file__).parent.parent / "engines",  # Relative to test file
+    ]
+    return any(p.exists() and list(p.glob("*.engine")) for p in possible_paths)
+
+
+@pytest.mark.skipif(not _engines_exist(), reason="Engines directory not found")
 class TestEngineFiles:
     """Test that engine files are valid (if they exist)."""
 
