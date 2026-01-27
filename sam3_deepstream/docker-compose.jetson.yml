@@ -37,15 +37,27 @@ services:
       # Set to 1 to use PE-enhanced backbone for improved text understanding
       - SAM3_USE_PE_BACKBONE=${SAM3_USE_PE_BACKBONE:-0}
       - SAM3_ALIGNMENT_TUNING=${SAM3_ALIGNMENT_TUNING:-1}
+      # TensorRT configuration
+      - SAM3_USE_TRT=${SAM3_USE_TRT:-0}
+      - SAM3_ENGINE_DIR=/workspace/sam3_deepstream/engines
+      # Output directory for saved results
+      - SAM3_OUTPUT_DIR=/workspace/outputs
 
     volumes:
+      # Mount source code for development (live reload)
+      - ./sam3_deepstream:/workspace/sam3_deepstream
+      - ../sam3:/workspace/sam3:ro
       # Mount engines from cache directory (built by install_jetson.sh)
       # Includes PE encoder engines when SAM3_USE_PE_BACKBONE=1
       - ${HOME}/.cache/sam3_deepstream/engines:/workspace/engines:ro
+      # Also check local engines directory
+      - ./engines:/workspace/sam3_deepstream/engines:ro
       # Mount SAM3 checkpoint for model loading
       - ../sam3/checkpoints:/workspace/checkpoints:ro
       # Mount data directory for uploads
       - ./data:/workspace/data
+      # Output directory for saved results
+      - ./outputs:/workspace/outputs
       # Cache CUDA kernels
       - sam3-cuda-cache:/workspace/.cuda_cache
       # Mount test data for running tests

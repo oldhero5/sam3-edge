@@ -185,7 +185,7 @@ class TestTextSegmentation:
         assert isinstance(data["detections"], list)
 
     def test_segment_returns_image_overlay(self, api_session, api_base_url: str, test_image_path: Path, require_model_loaded):
-        """Without return_json, should return PNG image."""
+        """Segment endpoint returns JSON with path to saved PNG overlay."""
         with open(test_image_path, "rb") as f:
             response = api_session.post(
                 f"{api_base_url}/api/v1/segment",
@@ -194,11 +194,13 @@ class TestTextSegmentation:
             )
 
         assert response.status_code == 200
-        assert response.headers.get("content-type") == "image/png"
+        assert response.headers.get("content-type") == "application/json"
 
-        # Should have custom headers
-        assert "X-Inference-Time-Ms" in response.headers
-        assert "X-Num-Detections" in response.headers
+        data = response.json()
+        # Should include paths to saved files
+        assert "output_image_path" in data
+        assert "output_json_path" in data
+        assert data["output_image_path"].endswith(".png")
 
     def test_segment_inference_time_reasonable(self, api_session, api_base_url: str, test_image_path: Path, require_model_loaded):
         """Inference time should be under 5 seconds."""

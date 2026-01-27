@@ -8,6 +8,7 @@ Provides REST API endpoints for image segmentation with text, point, or box prom
 import asyncio
 import base64
 import io
+import json
 import logging
 import os
 import time
@@ -32,6 +33,10 @@ logger = logging.getLogger(__name__)
 _runtime = None
 _startup_time = None
 
+# Output directory for saved results
+OUTPUT_DIR = Path(os.environ.get("SAM3_OUTPUT_DIR", "./outputs"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # ============================================================================
 # Pydantic Models
@@ -47,6 +52,7 @@ class HealthResponse(BaseModel):
     gpu_memory_used_mb: Optional[float] = None
     gpu_memory_total_mb: Optional[float] = None
     backbone_type: Optional[str] = None  # "PE" or "ViT"
+    trt_enabled: bool = False
 
 
 class InferenceStats(BaseModel):
@@ -63,6 +69,7 @@ class DetectionResult(BaseModel):
     bbox: List[float] = Field(..., description="[x1, y1, x2, y2] in pixels")
     score: float
     mask_area: int
+    mask_rle: Optional[dict] = Field(None, description="RLE-encoded mask {counts: str, size: [h, w]}")
 
 
 class SegmentResponse(BaseModel):
@@ -71,6 +78,8 @@ class SegmentResponse(BaseModel):
     inference_time_ms: float
     num_detections: int
     detections: List[DetectionResult]
+    output_image_path: Optional[str] = Field(None, description="Path to saved PNG overlay")
+    output_json_path: Optional[str] = Field(None, description="Path to saved JSON results")
 
 
 # ============================================================================
@@ -86,7 +95,10 @@ class SAM3Runtime:
     Supports optional PE (Perception Encoder) backbone for improved
     text prompt understanding via alignment tuning.
 
-    Set SAM3_USE_PE_BACKBONE=1 to enable PE backbone.
+    Environment variables:
+        SAM3_USE_PE_BACKBONE=1  - Enable PE backbone
+        SAM3_USE_TRT=1          - Enable TensorRT acceleration (future)
+        SAM3_ENGINE_DIR=./engines - Directory containing TRT engines
     """
 
     def __init__(
@@ -101,12 +113,17 @@ class SAM3Runtime:
         self.resolution = resolution
         self.processor = None
         self.model = None
+        self.trt_runtime = None
 
         # Check PE configuration from environment
         if use_pe_backbone is None:
             use_pe_backbone = os.environ.get('SAM3_USE_PE_BACKBONE', '0') == '1'
         self.use_pe_backbone = use_pe_backbone
         self.use_alignment_tuning = os.environ.get('SAM3_ALIGNMENT_TUNING', '1') == '1'
+
+        # TensorRT configuration (for future acceleration)
+        self.use_trt = os.environ.get('SAM3_USE_TRT', '0') == '1'
+        self.engine_dir = Path(os.environ.get('SAM3_ENGINE_DIR', './engines'))
 
         # Stats
         self.stats = {
@@ -116,6 +133,7 @@ class SAM3Runtime:
             'inference_times': [],
             'errors': 0,
             'backbone_type': 'PE' if self.use_pe_backbone else 'ViT',
+            'trt_enabled': False,
         }
 
     def load_model(self):
@@ -164,6 +182,22 @@ class SAM3Runtime:
                 confidence_threshold=0.5
             )
 
+            # Optionally load TensorRT engines for accelerated inference
+            if self.use_trt and self._engines_exist():
+                try:
+                    from sam3_deepstream.inference.trt_runtime import SAM3TRTRuntime
+                    encoder_path = self.engine_dir / "sam3_encoder.engine"
+                    decoder_path = self.engine_dir / "sam3_decoder.engine"
+                    self.trt_runtime = SAM3TRTRuntime(
+                        encoder_engine_path=encoder_path,
+                        decoder_engine_path=decoder_path if decoder_path.exists() else None,
+                    )
+                    self.stats['trt_enabled'] = True
+                    logger.info(f"TensorRT engines loaded from {self.engine_dir}")
+                except Exception as e:
+                    logger.warning(f"TRT loading failed, using PyTorch: {e}")
+                    self.trt_runtime = None
+
             logger.info(f"SAM3 model loaded successfully with {backbone_type} backbone")
             return True
 
@@ -171,6 +205,11 @@ class SAM3Runtime:
             logger.error(f"Failed to load SAM3 model: {e}")
             self.stats['errors'] += 1
             return False
+
+    def _engines_exist(self) -> bool:
+        """Check if TensorRT engines exist."""
+        encoder_path = self.engine_dir / "sam3_encoder.engine"
+        return encoder_path.exists()
 
     def segment_with_text(self, image: np.ndarray, text_prompt: str) -> Dict:
         """
@@ -379,6 +418,7 @@ async def health_check():
     uptime = time.time() - _startup_time if _startup_time else 0
     model_loaded = _runtime is not None and _runtime.processor is not None
     backbone_type = _runtime.stats.get('backbone_type', 'unknown') if _runtime else None
+    trt_enabled = _runtime.stats.get('trt_enabled', False) if _runtime else False
 
     return HealthResponse(
         status="healthy" if model_loaded else "degraded",
@@ -389,6 +429,7 @@ async def health_check():
         gpu_memory_used_mb=gpu_memory_used,
         gpu_memory_total_mb=gpu_memory_total,
         backbone_type=backbone_type,
+        trt_enabled=trt_enabled,
     )
 
 
@@ -407,16 +448,17 @@ async def segment_with_text(
     file: UploadFile = File(...),
     text_prompt: str = Form(..., description="Text description of object to segment"),
     confidence_threshold: float = Form(0.5, description="Minimum confidence 0-1"),
-    return_json: bool = Form(False, description="Return JSON instead of image"),
 ):
     """
     Segment objects using text prompt (SAM3 native VETextEncoder).
 
+    Returns JSON with detection results and RLE-encoded masks.
+    Also saves PNG overlay and JSON to outputs/ folder.
+
     Example:
         curl -X POST http://localhost:8000/api/v1/segment \\
           -F "file=@image.jpg" \\
-          -F "text_prompt=red car" \\
-          --output result.png
+          -F "text_prompt=red car" | jq
     """
     if not _runtime or not _runtime.processor:
         raise HTTPException(status_code=503, detail="Model not loaded")
@@ -424,6 +466,7 @@ async def segment_with_text(
     try:
         from PIL import Image
         import cv2
+        from sam3_deepstream.utils.mask_utils import encode_rle
 
         # Load image
         image_data = await file.read()
@@ -446,66 +489,78 @@ async def segment_with_text(
 
         num_detections = len(scores) if hasattr(scores, '__len__') else 0
 
-        if return_json:
-            # Return JSON response
-            detections = []
+        # Build detections with RLE-encoded masks
+        detections = []
+        for i in range(num_detections):
+            if i < len(masks):
+                mask = masks[i].squeeze()
+                if mask.shape != (h, w):
+                    mask = cv2.resize(mask.astype(np.float32), (w, h))
+                mask_binary = (mask > 0.5).astype(np.uint8)
+                rle = encode_rle(mask_binary)
+                mask_area = int(mask_binary.sum())
+            else:
+                rle = None
+                mask_area = 0
+
+            detections.append(DetectionResult(
+                bbox=boxes[i].tolist() if i < len(boxes) else [0, 0, 0, 0],
+                score=float(scores[i]) if i < len(scores) else 0.0,
+                mask_area=mask_area,
+                mask_rle=rle,
+            ))
+
+        # Create mask overlay image
+        overlay = image_np.copy()
+        if num_detections > 0:
+            combined_mask = np.zeros((h, w), dtype=bool)
             for i in range(num_detections):
-                mask_area = int(masks[i].sum()) if i < len(masks) else 0
-                detections.append(DetectionResult(
-                    bbox=boxes[i].tolist() if i < len(boxes) else [0, 0, 0, 0],
-                    score=float(scores[i]) if i < len(scores) else 0.0,
-                    mask_area=mask_area,
-                ))
+                if i < len(masks):
+                    mask = masks[i].squeeze()
+                    if mask.shape != (h, w):
+                        mask = cv2.resize(mask.astype(np.float32), (w, h)) > 0.5
+                    combined_mask |= mask
 
-            return SegmentResponse(
-                success=True,
-                inference_time_ms=inference_time,
-                num_detections=num_detections,
-                detections=detections,
-            )
-        else:
-            # Create mask overlay image
-            overlay = image_np.copy()
+            # Apply green overlay
+            overlay[combined_mask] = (
+                overlay[combined_mask] * 0.5 + np.array([0, 255, 0]) * 0.5
+            ).astype(np.uint8)
 
-            if num_detections > 0:
-                # Combine all masks
-                combined_mask = np.zeros((h, w), dtype=bool)
-                for i in range(num_detections):
-                    if i < len(masks):
-                        mask = masks[i].squeeze()
-                        if mask.shape != (h, w):
-                            mask = cv2.resize(mask.astype(np.float32), (w, h)) > 0.5
-                        combined_mask |= mask
+            # Draw bounding boxes
+            for i in range(min(num_detections, len(boxes))):
+                box = boxes[i].astype(int)
+                cv2.rectangle(overlay, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+                if i < len(scores):
+                    label = f"{text_prompt}: {scores[i]:.2f}"
+                    cv2.putText(overlay, label, (box[0], box[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-                # Apply green overlay
-                overlay[combined_mask] = (
-                    overlay[combined_mask] * 0.5 + np.array([0, 255, 0]) * 0.5
-                ).astype(np.uint8)
+        # Generate unique filename
+        timestamp = int(time.time() * 1000)
+        safe_prompt = "".join(c if c.isalnum() else "_" for c in text_prompt)[:30]
+        base_name = f"{timestamp}_{safe_prompt}"
 
-                # Draw bounding boxes
-                for i in range(min(num_detections, len(boxes))):
-                    box = boxes[i].astype(int)
-                    cv2.rectangle(overlay, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
-                    if i < len(scores):
-                        label = f"{text_prompt}: {scores[i]:.2f}"
-                        cv2.putText(overlay, label, (box[0], box[1] - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        # Save PNG overlay
+        png_path = OUTPUT_DIR / f"{base_name}.png"
+        result_image = Image.fromarray(overlay)
+        result_image.save(png_path)
 
-            # Return as PNG
-            result_image = Image.fromarray(overlay)
-            img_buffer = io.BytesIO()
-            result_image.save(img_buffer, format='PNG')
-            img_buffer.seek(0)
+        # Build response data
+        response_data = SegmentResponse(
+            success=True,
+            inference_time_ms=inference_time,
+            num_detections=num_detections,
+            detections=detections,
+            output_image_path=str(png_path),
+            output_json_path=str(OUTPUT_DIR / f"{base_name}.json"),
+        )
 
-            return StreamingResponse(
-                img_buffer,
-                media_type="image/png",
-                headers={
-                    "X-Inference-Time-Ms": str(inference_time),
-                    "X-Num-Detections": str(num_detections),
-                    "X-Text-Prompt": text_prompt,
-                }
-            )
+        # Save JSON
+        json_path = OUTPUT_DIR / f"{base_name}.json"
+        with open(json_path, "w") as f:
+            json.dump(response_data.model_dump(), f, indent=2)
+
+        return response_data
 
     except Exception as e:
         logger.error(f"Segment error: {e}")
