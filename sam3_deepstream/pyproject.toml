@@ -76,3 +76,11 @@ dev = [
 [tool.uv.sources]
 # SAM3 from local directory (includes trt_export.py for TensorRT support)
 sam3 = { path = "../sam3", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "gpu: test requires GPU/CUDA",
+    "slow: slow running test",
+]

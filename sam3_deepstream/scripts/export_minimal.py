@@ -7,6 +7,7 @@ This script directly loads checkpoint weights and exports to TensorRT.
 import argparse
 import logging
 import os
+import sys
 from pathlib import Path
 
 import torch

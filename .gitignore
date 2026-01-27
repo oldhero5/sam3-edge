@@ -79,6 +79,6 @@ cuda-keyring*.deb
 
 # Claude Code
 .claude/
-
+CLAUDE.md
 # SAM3 dependency (pulled from git fork)
 sam3/
