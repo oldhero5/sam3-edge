@@ -51,17 +51,18 @@ Thumbs.db
 checkpoints/
 sam3/checkpoints/
 
-# TensorRT engines (platform-specific, regenerable)
-*.engine
-*.onnx
-sam3_deepstream/engines/*.engine
-sam3_deepstream/engines/*.onnx
+# TensorRT engines tracked via Git LFS
+# Engine files are platform-specific but tracked for this Jetson build
 
 # Logs
 logs/
 *.log
 runs/
 tensorboard/
+
+# Output directories (generated files)
+outputs/
+sam3_deepstream/outputs/
 
 # Data files
 *.h5
@@ -79,6 +80,6 @@ cuda-keyring*.deb
 
 # Claude Code
 .claude/
-
+CLAUDE.md
 # SAM3 dependency (pulled from git fork)
 sam3/

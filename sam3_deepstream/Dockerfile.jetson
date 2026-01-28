@@ -1,21 +1,16 @@
 # SAM3 Inference API - Jetson Optimized Container
 #
-# This Dockerfile is optimized for Jetson AGX Orin with JetPack 6.x
+# Uses SAM3's native VETextEncoder for text prompt support
+# Optimized for Jetson AGX Orin with JetPack 6.x
 #
-# Build on Jetson:
-#   docker build -f Dockerfile.jetson -t sam3-api:jetson .
-#
-# Or use jetson-containers:
-#   jetson-containers build --name sam3-api pytorch tensorrt
+# Build:
+#   docker build -f Dockerfile.jetson -t sam3-edge:jetson .
 #
 # Run:
 #   docker run --runtime nvidia --gpus all -p 8000:8000 \
-#     -v $(pwd)/engines:/workspace/engines \
-#     -v /tmp/.X11-unix:/tmp/.X11-unix \
-#     -e DISPLAY=$DISPLAY \
-#     sam3-api:jetson
+#     -v ~/.cache/sam3_deepstream/engines:/workspace/engines:ro \
+#     sam3-edge:jetson
 
-# Use dusty-nv's l4t-pytorch image (includes PyTorch, TensorRT, CUDA)
 ARG L4T_VERSION=r36.4.0
 FROM dustynv/l4t-pytorch:${L4T_VERSION}
 
@@ -24,61 +19,80 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# The base image already has PyTorch, TensorRT, CUDA
-# Just install FastAPI and other Python deps
-
 WORKDIR /workspace
 
-# Install system dependencies for SQLite
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-RUN pip3 install --no-cache-dir \
+# Copy constraints file first (for pip to use)
+COPY sam3_deepstream/constraints.txt /workspace/
+
+# Install Python dependencies with constraints (prevents numpy 2.x)
+RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple/ \
+    -c /workspace/constraints.txt \
     fastapi>=0.104.0 \
-    uvicorn[standard]>=0.24.0 \
+    "uvicorn[standard]>=0.24.0" \
     python-multipart>=0.0.6 \
     pydantic>=2.0.0 \
     pillow>=10.0.0 \
     aiofiles>=23.0.0 \
     aiosqlite>=0.19.0 \
-    faiss-gpu>=1.7.4
+    faiss-cpu>=1.7.2 \
+    einops>=0.7.0 \
+    triton>=2.1.0 \
+    decord2>=3.0.0 \
+    pycocotools>=2.0.0
 
-# Copy application code
-COPY sam3_deepstream /workspace/sam3_deepstream
+# Copy and install sam3 package (non-editable for proper caching)
+COPY sam3 /workspace/sam3
+RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple/ \
+    -c /workspace/constraints.txt \
+    /workspace/sam3 && \
+    rm -rf /workspace/sam3
+
+# Copy sam3_deepstream package
+COPY sam3_deepstream/sam3_deepstream /workspace/sam3_deepstream
 COPY pyproject.toml /workspace/
 
-# Install sam3_deepstream package
-RUN pip3 install --no-cache-dir -e .
+# Install sam3_deepstream (non-editable)
+RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple/ \
+    -c /workspace/constraints.txt \
+    .
+
+# Install test dependencies
+RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple/ \
+    pytest>=7.0.0 \
+    pytest-asyncio>=0.21.0 \
+    requests>=2.28.0
+
+# Copy tests and scripts (test_data should be mounted at runtime if needed)
+COPY sam3_deepstream/tests /workspace/tests
+COPY sam3_deepstream/scripts /workspace/scripts
 
 # Create directories
-RUN mkdir -p /workspace/engines /workspace/data /workspace/logs /workspace/db
+RUN mkdir -p /workspace/engines /workspace/uploads /workspace/db
 
 # Environment configuration
 ENV SAM3_ENCODER_ENGINE=/workspace/engines/sam3_encoder.engine
 ENV SAM3_DECODER_ENGINE=/workspace/engines/sam3_decoder.engine
+ENV SAM3_CHECKPOINT=/workspace/checkpoints/sam3.pt
 ENV CUDA_DEVICE=0
-ENV USE_ASYNC=true
 ENV HOST=0.0.0.0
 ENV PORT=8000
-ENV WORKERS=1
 
-# Database configuration for NLQ
-ENV SAM3_DB_PATH=/workspace/db/detections.db
-ENV SAM3_FAISS_INDEX=/workspace/db/embeddings.index
-ENV SAM3_USE_GPU_FAISS=true
+# PE (Perception Encoder) configuration
+# Set SAM3_USE_PE_BACKBONE=1 to use PE-enhanced backbone
+ENV SAM3_USE_PE_BACKBONE=0
+ENV SAM3_PE_ENCODER_ENGINE=/workspace/engines/pe_encoder_fp16.engine
+ENV SAM3_ALIGNMENT_TUNING=1
 
 # Jetson-specific optimizations
 ENV CUDA_CACHE_DISABLE=0
 ENV CUDA_CACHE_PATH=/workspace/.cuda_cache
 ENV TRT_ENGINE_CACHE_ENABLE=1
-
-# Memory optimization for Jetson
 ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
-
-# Persistent volume for database
-VOLUME /workspace/db
 
 EXPOSE 8000
 

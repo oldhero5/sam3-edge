@@ -1,0 +1,38 @@
+# Ignore large unnecessary files for Docker build
+.git
+.gitignore
+*.md
+!sam3_deepstream/README.md
+
+# Checkpoints and engines (mounted at runtime)
+checkpoints/
+*.pt
+*.pth
+*.engine
+*.onnx
+
+# Test data
+test_data/
+*.png
+*.jpg
+*.jpeg
+
+# Cache directories
+__pycache__/
+*.pyc
+.cache/
+.cuda_cache/
+
+# Virtual environments
+.venv/
+venv/
+.uv/
+
+# IDE
+.vscode/
+.idea/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/

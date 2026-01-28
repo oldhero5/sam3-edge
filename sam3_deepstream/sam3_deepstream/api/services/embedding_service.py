@@ -1,6 +1,13 @@
-"""Embedding service for generating text embeddings using SAM3's VETextEncoder."""
+"""Embedding service for generating text embeddings using SAM3's VETextEncoder.
+
+Supports both standard VETextEncoder and PE (Perception Encoder) text encoder
+for improved vision-language alignment.
+
+Set SAM3_USE_PE_BACKBONE=1 to use PE text encoder.
+"""
 
 import logging
+import os
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -12,10 +19,13 @@ logger = logging.getLogger(__name__)
 
 class EmbeddingService:
     """
-    Generates text embeddings using SAM3's VETextEncoder.
+    Generates text embeddings using SAM3's VETextEncoder or PE text encoder.
 
     The VETextEncoder is a 24-layer transformer with CLIP-based tokenization
     that produces 256-dimensional embeddings for text prompts.
+
+    When SAM3_USE_PE_BACKBONE=1, uses PETextEncoder which provides better
+    alignment with PE vision encoder through contrastive pretraining.
     """
 
     def __init__(
@@ -23,6 +33,7 @@ class EmbeddingService:
         bpe_path: Optional[str] = None,
         device: str = "cuda",
         embedding_dim: int = 256,
+        use_pe_encoder: Optional[bool] = None,
     ):
         """
         Initialize embedding service.
@@ -31,6 +42,7 @@ class EmbeddingService:
             bpe_path: Path to BPE vocabulary file. If None, uses SAM3 default.
             device: Device for inference ("cuda" or "cpu")
             embedding_dim: Output embedding dimension (256 from VETextEncoder)
+            use_pe_encoder: Use PE text encoder. If None, reads from SAM3_USE_PE_BACKBONE env var.
         """
         self.device = device
         self.embedding_dim = embedding_dim
@@ -39,13 +51,18 @@ class EmbeddingService:
         self._bpe_path = bpe_path
         self._initialized = False
 
+        # Check PE configuration
+        if use_pe_encoder is None:
+            use_pe_encoder = os.environ.get('SAM3_USE_PE_BACKBONE', '0') == '1'
+        self.use_pe_encoder = use_pe_encoder
+        self._encoder_type = "PE" if use_pe_encoder else "VE"
+
     def initialize(self) -> None:
-        """Initialize the text encoder."""
+        """Initialize the text encoder (VE or PE based on configuration)."""
         if self._initialized:
             return
 
         try:
-            from sam3.model.text_encoder_ve import VETextEncoder
             from sam3.model.tokenizer_ve import SimpleTokenizer
             import pkg_resources
 
@@ -60,19 +77,38 @@ class EmbeddingService:
                     sam3_path = Path(__file__).parent.parent.parent.parent.parent / "sam3"
                     self._bpe_path = str(sam3_path / "sam3" / "assets" / "bpe_simple_vocab_16e6.txt.gz")
 
-            # Initialize tokenizer and encoder
+            # Initialize tokenizer
             self._tokenizer = SimpleTokenizer(bpe_path=self._bpe_path)
-            self._encoder = VETextEncoder(
-                tokenizer=self._tokenizer,
-                d_model=self.embedding_dim,
-                width=1024,
-                heads=16,
-                layers=24,
-            )
-            self._encoder = self._encoder.to(self.device).eval()
 
+            if self.use_pe_encoder:
+                # Use PE text encoder for better alignment
+                from sam3.model.pe_text_encoder import PETextEncoder
+
+                self._encoder = PETextEncoder(
+                    tokenizer=self._tokenizer,
+                    d_model=self.embedding_dim,
+                    width=1024,
+                    heads=16,
+                    layers=24,
+                    max_seq_len=32,
+                )
+                logger.info(f"Initialized PE text encoder on {self.device}")
+            else:
+                # Use standard VE text encoder
+                from sam3.model.text_encoder_ve import VETextEncoder
+
+                self._encoder = VETextEncoder(
+                    tokenizer=self._tokenizer,
+                    d_model=self.embedding_dim,
+                    width=1024,
+                    heads=16,
+                    layers=24,
+                )
+                logger.info(f"Initialized VE text encoder on {self.device}")
+
+            self._encoder = self._encoder.to(self.device).eval()
             self._initialized = True
-            logger.info(f"EmbeddingService initialized on {self.device}")
+            logger.info(f"EmbeddingService ({self._encoder_type}) ready")
 
         except ImportError as e:
             logger.warning(f"SAM3 text encoder not available: {e}")
@@ -154,6 +190,11 @@ class EmbeddingService:
         if not self._initialized:
             self.initialize()
         return self._encoder is not None
+
+    @property
+    def encoder_type(self) -> str:
+        """Get the type of text encoder being used ('PE' or 'VE')."""
+        return self._encoder_type
 
 
 # Global embedding service instance

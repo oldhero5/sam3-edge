@@ -18,54 +18,57 @@ SAM3-Edge brings Meta's Segment Anything Model 3 (SAM3) to edge devices, specifi
 
 ```
 sam3-edge/
+├── sam3/                     # SAM3 model (local submodule)
+│   └── sam3/model/trt_export.py  # TensorRT export wrapper
 ├── sam3_deepstream/          # Main package
 │   ├── api/                  # FastAPI REST server
 │   ├── export/               # TensorRT export utilities
 │   ├── inference/            # Runtime inference engines
 │   └── deepstream/           # DeepStream pipeline configs
-└── pyproject.toml            # UV workspace config (pulls sam3 from fork)
+├── install_jetson.sh         # One-shot Jetson installation script
+└── pyproject.toml            # UV workspace config
 ```
 
 **Dependencies:**
-- [sam3](https://github.com/oldhero5/sam3) - SAM3 model with Jetson optimizations (pulled as git dependency)
+- `sam3/` - SAM3 model with TensorRT export support (local directory)
 
 ## Quick Start
 
 ### Prerequisites
 
-- NVIDIA Jetson AGX Orin with JetPack 6.0+
-- CUDA 12.x, TensorRT 10.x
-- Python 3.10+, UV package manager
+- NVIDIA Jetson AGX Orin with JetPack 6.x (R36.4+)
+- Docker with NVIDIA Container Toolkit
+- PyTorch with CUDA from NVIDIA's Jetson wheel server
 
-### Installation
+### Installation (One Command)
 
 ```bash
 # Clone the repository
 git clone https://github.com/oldhero5/sam3-edge.git
 cd sam3-edge
 
-# Install dependencies (UV will fetch sam3 from fork)
-uv sync
+# Place SAM3 checkpoint in expected location
+mkdir -p sam3/checkpoints
+cp /path/to/sam3.pt sam3/checkpoints/
 
-# Download SAM3 checkpoint
-# Place in ~/.cache/sam3_deepstream/checkpoints/
-
-# Export TensorRT engines
-uv run python -m sam3_deepstream.scripts.export_engines \
-    --checkpoint ~/.cache/sam3_deepstream/checkpoints/sam3_hiera_large.pt \
-    --output-dir ~/.cache/sam3_deepstream/engines \
-    --precision fp16
+# Run full installation (builds Docker, exports TensorRT engines)
+./install_jetson.sh
 ```
+
+The installation script:
+1. Installs system dependencies and UV package manager
+2. Builds the Docker image with all dependencies
+3. Exports TensorRT engines **inside Docker** (ensures TRT version compatibility)
+4. Prepares database directories
 
 ### Run API Server
 
 ```bash
-# Start FastAPI server
-uv run sam3-api
-
-# Or with Docker
 cd sam3_deepstream
-docker compose -f docker-compose.jetson.yml up
+docker compose -f docker-compose.jetson.yml up -d
+
+# Check health
+curl http://localhost:8000/health
 ```
 
 ### API Usage
@@ -208,21 +211,31 @@ docker build -f Dockerfile.jetson -t sam3-edge:jetson .
 For complete Jetson AGX Orin setup, use the installation script:
 
 ```bash
-# Full installation (system deps, Docker, database)
+# Full installation (system deps, Docker, TRT export, database)
 ./install_jetson.sh
 
-# With TensorRT engine export
+# With explicit checkpoint path
 ./install_jetson.sh --checkpoint /path/to/sam3_checkpoint.pt
 
-# Docker image only
+# Docker image only (no TRT export)
 ./install_jetson.sh --docker-only
+
+# Skip Docker rebuild (use existing image)
+./install_jetson.sh --skip-docker
 
 # Health check
 ./install_jetson.sh --health-check
-
-# Initialize database only
-./install_jetson.sh --init-db
 ```
+
+### TensorRT Version Compatibility
+
+TensorRT engines are **platform-specific** and must be built with the same TensorRT version used at runtime. The installation script handles this automatically by:
+
+1. Building the Docker image first
+2. Running TensorRT export **inside the Docker container**
+3. Mounting the output directory so engines are accessible on host
+
+This ensures the engines work correctly regardless of host vs container TensorRT version differences.
 
 ### Installation Options
 
