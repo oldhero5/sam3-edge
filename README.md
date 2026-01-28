@@ -43,9 +43,11 @@ sam3-edge/
 ### Installation (One Command)
 
 ```bash
-# Clone the repository
+# Clone with Git LFS (required for TensorRT engines)
+git lfs install
 git clone https://github.com/oldhero5/sam3-edge.git
 cd sam3-edge
+git lfs pull
 
 # Place SAM3 checkpoint in expected location
 mkdir -p sam3/checkpoints
@@ -77,11 +79,15 @@ curl http://localhost:8000/health
 # Health check
 curl http://localhost:8000/health
 
-# Segment an image
-curl -X POST "http://localhost:8000/segment" \
-  -F "image=@test.jpg" \
-  -F "points=[[512,512]]" \
-  -F "labels=[1]"
+# Text-based segmentation (returns JSON with RLE masks, saves PNG to outputs/)
+curl -X POST http://localhost:8000/api/v1/segment \
+  -F "file=@test.jpg" \
+  -F "text_prompt=car"
+
+# Point-based segmentation
+curl -X POST http://localhost:8000/segment \
+  -F "file=@test.jpg" \
+  -F "points=0.5,0.5,1"
 ```
 
 ## Natural Language Query (NLQ)
@@ -168,15 +174,13 @@ Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HF_TOKEN` | - | HuggingFace token for model download |
+| `SAM3_USE_TRT` | 0 | Enable TensorRT acceleration |
+| `SAM3_ENGINE_DIR` | ./engines | Directory containing TRT engines |
+| `SAM3_OUTPUT_DIR` | ./outputs | Directory for saved results |
+| `SAM3_USE_PE_BACKBONE` | 0 | Enable Perception Encoder backbone |
 | `SAM3_CHECKPOINT` | - | Path to SAM3 checkpoint |
-| `SAM3_ENCODER_ENGINE` | - | Path to encoder TensorRT engine |
-| `SAM3_DECODER_ENGINE` | - | Path to decoder TensorRT engine |
 | `API_HOST` | 0.0.0.0 | API server host |
 | `API_PORT` | 8000 | API server port |
-| `SAM3_DB_PATH` | ~/.cache/sam3_deepstream/db/detections.db | SQLite database path |
-| `SAM3_FAISS_INDEX` | ~/.cache/sam3_deepstream/db/embeddings.index | FAISS index path |
-| `SAM3_USE_GPU_FAISS` | true | Use GPU for FAISS operations |
 
 ## Performance
 
@@ -195,15 +199,14 @@ With keyframe optimization (reusing embeddings):
 ## Development
 
 ```bash
-# Install dev dependencies
-uv sync --group dev
-
-# Run tests
-uv run pytest sam3_deepstream/tests/ -v
+# Run tests (Docker with GPU)
+make test
 
 # Build Docker image
-cd sam3_deepstream
-docker build -f Dockerfile.jetson -t sam3-edge:jetson .
+make build
+
+# Export TensorRT engines
+make export
 ```
 
 ## Jetson Installation
