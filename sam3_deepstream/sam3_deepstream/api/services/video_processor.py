@@ -18,7 +18,6 @@ from ...inference.mask_propagation import MaskPropagator
 from ...utils.mask_utils import encode_rle, visualize_masks
 from ..models.requests import OutputFormat, VideoProcessRequest
 from .detection_store import Detection, DetectionStore, VideoMetadata, get_detection_store
-from .embedding_service import EmbeddingService, get_embedding_service
 
 logger = logging.getLogger(__name__)
 
@@ -176,11 +175,8 @@ class VideoProcessor:
             total_frames=total_frames,
         ))
 
-        # Get embedding service for text prompt
-        embedding_service = get_embedding_service()
+        # Embedding service removed (NLQ feature not implemented)
         prompt_embedding = None
-        if store_embeddings:
-            prompt_embedding = embedding_service.encode(request.text_prompt)
 
         # Build SAM3 model
         try:

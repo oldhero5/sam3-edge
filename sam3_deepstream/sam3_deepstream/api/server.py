@@ -370,7 +370,20 @@ async def lifespan(app: FastAPI):
     upload_dir.mkdir(parents=True, exist_ok=True)
     app.state.upload_dir = upload_dir
 
+    # Initialize job manager for video processing
+    from sam3_deepstream.api.services.job_manager import JobManager
+    from sam3_deepstream.config import get_config
+    config = get_config()
+    app.state.config = config
+    app.state.job_manager = JobManager(config)
+    app.state.job_manager.start()
+    logger.info("Job manager started for video processing")
+
     yield
+
+    # Cleanup job manager
+    if hasattr(app.state, 'job_manager'):
+        app.state.job_manager.stop()
 
     # Cleanup
     logger.info("Shutting down SAM3 API Server...")
@@ -391,6 +404,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Register video processing router
+from sam3_deepstream.api.routes import video
+app.include_router(video.router)
 
 
 # ============================================================================
