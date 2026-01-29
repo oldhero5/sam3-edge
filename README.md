@@ -10,9 +10,8 @@ SAM3-Edge brings Meta's Segment Anything Model 3 (SAM3) to edge devices, specifi
 - **DeepStream Integration**: GStreamer pipeline with nvinfer plugin for hardware-accelerated video processing
 - **FastAPI Server**: REST API for inference on images and video streams
 - **CUDA Streams**: Async pipelined inference to minimize latency
-- **Natural Language Queries**: Text-based object detection ("green traffic lights") with semantic search
-- **FAISS Vector Search**: GPU-accelerated similarity search across detected objects
-- **SQLite Storage**: Persistent detection storage for offline query
+- **Text Prompts**: Segment objects by description ("red car", "person") using SAM3's native VETextEncoder
+- **SQLite Storage**: Persistent detection storage for video processing
 
 ## Architecture
 
@@ -207,11 +206,9 @@ SAM3-Edge is designed for future multi-device federation where many Jetson devic
 Current design supports:
 - `device_id` tracking in all database tables
 - Export endpoint for syncing detections
-- Embedding-based deduplication
 
 Future features (planned):
 - Automatic sync to central aggregation server
-- Federated learning across devices
 - Distributed query across device network
 
 ## License

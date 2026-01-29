@@ -138,7 +138,6 @@ class VideoProcessor:
 
         # Import SAM3 components
         try:
-            from sam3.model_builder import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
         except ImportError as e:
             logger.error(f"SAM3 not available for text prompt processing: {e}")
@@ -178,14 +177,35 @@ class VideoProcessor:
         # Embedding service removed (NLQ feature not implemented)
         prompt_embedding = None
 
-        # Build SAM3 model
+        # Build SAM3 model - use same approach as working server endpoint
         try:
-            model = build_sam3_image_model(
+            from sam3.model_builder import build_sam3_hiera_l
+
+            checkpoint_path = self.config.sam3_checkpoint
+            if checkpoint_path is None:
+                # Try common locations
+                for path in [
+                    Path("/workspace/checkpoints/sam3.pt"),
+                    Path.home() / ".cache" / "sam3" / "sam3.pt",
+                ]:
+                    if path.exists():
+                        checkpoint_path = path
+                        break
+
+            logger.info(f"Loading SAM3 model from {checkpoint_path}")
+            model = build_sam3_hiera_l(
+                checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
                 device="cuda",
                 eval_mode=True,
-                checkpoint_path=str(self.config.sam3_checkpoint) if self.config.sam3_checkpoint else None,
+                load_from_HF=False,
             )
-            processor = Sam3Processor(model, confidence_threshold=request.segmentation_threshold)
+            processor = Sam3Processor(
+                model,
+                resolution=1008,
+                device="cuda",
+                confidence_threshold=request.segmentation_threshold,
+            )
+            logger.info("SAM3 model loaded successfully for video processing")
         except Exception as e:
             logger.error(f"Failed to build SAM3 model: {e}")
             cap.release()
@@ -219,29 +239,46 @@ class VideoProcessor:
                     state = processor.set_image(pil_image)
                     state = processor.set_text_prompt(request.text_prompt, state)
 
-                    # Extract results
-                    masks = state.get("masks", [])
-                    boxes = state.get("boxes", [])
-                    scores = state.get("scores", [])
+                    import torch
+
+                    # Debug: log state keys
+                    logger.info(f"Frame {frame_idx} SAM3 state keys: {list(state.keys()) if isinstance(state, dict) else type(state)}")
+
+                    # Extract results - match working server endpoint approach
+                    masks = state.get("masks", torch.zeros(0, 1, height, width))
+                    boxes = state.get("boxes", torch.zeros(0, 4))
+                    scores = state.get("scores", torch.zeros(0))
+
+                    # Convert to numpy if tensor
+                    if torch.is_tensor(masks):
+                        masks = masks.cpu().numpy()
+                    if torch.is_tensor(boxes):
+                        boxes = boxes.cpu().numpy()
+                    if torch.is_tensor(scores):
+                        scores = scores.cpu().numpy()
+
+                    logger.info(f"Frame {frame_idx} extracted: {len(masks) if hasattr(masks, '__len__') else 0} masks")
 
                     frame_masks = []
                     frame_boxes = []
                     frame_scores = []
                     frame_object_ids = []
 
-                    for obj_idx, (mask, box, score) in enumerate(zip(masks, boxes, scores)):
+                    num_detections = len(scores) if hasattr(scores, '__len__') else 0
+                    for obj_idx in range(num_detections):
+                        score = float(scores[obj_idx])
                         if score < request.segmentation_threshold:
                             continue
 
-                        # Convert mask to numpy if tensor
-                        if hasattr(mask, 'cpu'):
-                            mask_np = mask.cpu().numpy()
-                        else:
-                            mask_np = np.array(mask)
+                        # Process mask - squeeze and resize to frame size
+                        mask = masks[obj_idx].squeeze()
+                        if mask.shape != (height, width):
+                            mask = cv2.resize(mask.astype(np.float32), (width, height))
+                        mask_np = (mask > 0.5).astype(np.uint8)
 
+                        # Get box
+                        box = boxes[obj_idx] if obj_idx < len(boxes) else np.array([0, 0, 0, 0])
                         # Normalize box to 0-1
-                        if hasattr(box, 'cpu'):
-                            box = box.cpu().numpy()
                         box_norm = (
                             float(box[0]) / width,
                             float(box[1]) / height,
@@ -256,7 +293,9 @@ class VideoProcessor:
 
                         # Create detection for storage
                         if store_masks or store_embeddings:
-                            rle = encode_rle(mask_np) if store_masks else None
+                            rle_dict = encode_rle(mask_np) if store_masks else None
+                            # Serialize to JSON string for SQLite storage
+                            rle_str = json.dumps(rle_dict) if rle_dict else None
                             detection = Detection(
                                 video_id=video_id,
                                 device_id=self.config.federation.device_id,
@@ -267,7 +306,7 @@ class VideoProcessor:
                                 label=request.text_prompt.split()[0] if request.text_prompt else None,
                                 confidence=float(score),
                                 bbox=box_norm,
-                                mask_rle=rle,
+                                mask_rle=rle_str,
                             )
                             detections.append(detection)
                             detection_count += 1
@@ -468,15 +507,25 @@ class VideoProcessor:
         request: VideoProcessRequest,
         output_path: Path,
     ) -> dict:
-        """Generate output file based on request format."""
-        if request.output_format == OutputFormat.VIDEO:
-            return await self._generate_video_output(
-                video_path, results, output_path
-            )
-        else:
-            return await self._generate_masks_output(
-                results, output_path
-            )
+        """Generate output files - always creates both video AND JSON."""
+        # Always generate both video with overlays AND JSON with masks
+        video_output_path = output_path.with_suffix(".mp4")
+        json_output_path = output_path.with_suffix(".json")
+
+        video_result = await self._generate_video_output(
+            video_path, results, video_output_path
+        )
+        json_result = await self._generate_masks_output(
+            results, json_output_path
+        )
+
+        # Return video path as main output, include JSON path
+        return {
+            "output_path": str(video_output_path),
+            "json_path": str(json_output_path),
+            "frames_processed": video_result["frames_processed"],
+            "format": "video+json",
+        }
 
     async def _generate_video_output(
         self,
