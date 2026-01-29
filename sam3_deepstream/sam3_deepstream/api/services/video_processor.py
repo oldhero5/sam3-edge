@@ -47,6 +47,7 @@ class VideoProcessor:
 
         self._processor: Optional[KeyframeProcessor] = None
         self._propagator: Optional[MaskPropagator] = None
+        self._sam3_processor = None  # Cached SAM3 processor for text prompts
 
     def _check_deepstream(self) -> bool:
         """Check if DeepStream is available."""
@@ -177,39 +178,44 @@ class VideoProcessor:
         # Embedding service removed (NLQ feature not implemented)
         prompt_embedding = None
 
-        # Build SAM3 model - use same approach as working server endpoint
-        try:
-            from sam3.model_builder import build_sam3_hiera_l
+        # Get or create cached SAM3 processor (avoid reloading model for each video)
+        if self._sam3_processor is None:
+            try:
+                from sam3.model_builder import build_sam3_hiera_l
 
-            checkpoint_path = self.config.sam3_checkpoint
-            if checkpoint_path is None:
-                # Try common locations
-                for path in [
-                    Path("/workspace/checkpoints/sam3.pt"),
-                    Path.home() / ".cache" / "sam3" / "sam3.pt",
-                ]:
-                    if path.exists():
-                        checkpoint_path = path
-                        break
+                checkpoint_path = self.config.sam3_checkpoint
+                if checkpoint_path is None:
+                    # Try common locations
+                    for path in [
+                        Path("/workspace/checkpoints/sam3.pt"),
+                        Path.home() / ".cache" / "sam3" / "sam3.pt",
+                    ]:
+                        if path.exists():
+                            checkpoint_path = path
+                            break
 
-            logger.info(f"Loading SAM3 model from {checkpoint_path}")
-            model = build_sam3_hiera_l(
-                checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
-                device="cuda",
-                eval_mode=True,
-                load_from_HF=False,
-            )
-            processor = Sam3Processor(
-                model,
-                resolution=1008,
-                device="cuda",
-                confidence_threshold=request.segmentation_threshold,
-            )
-            logger.info("SAM3 model loaded successfully for video processing")
-        except Exception as e:
-            logger.error(f"Failed to build SAM3 model: {e}")
-            cap.release()
-            return {"error": str(e), "frames_processed": 0}
+                logger.info(f"Loading SAM3 model from {checkpoint_path}")
+                model = build_sam3_hiera_l(
+                    checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
+                    device="cuda",
+                    eval_mode=True,
+                    load_from_HF=False,
+                )
+                self._sam3_processor = Sam3Processor(
+                    model,
+                    resolution=1008,
+                    device="cuda",
+                    confidence_threshold=0.5,
+                )
+                logger.info("SAM3 model loaded and cached for video processing")
+            except Exception as e:
+                logger.error(f"Failed to build SAM3 model: {e}")
+                cap.release()
+                return {"error": str(e), "frames_processed": 0}
+
+        # Update confidence threshold for this request
+        processor = self._sam3_processor
+        processor.confidence_threshold = request.segmentation_threshold
 
         results: List[FrameResult] = []
         detections: List[Detection] = []
@@ -376,6 +382,14 @@ class VideoProcessor:
         output_result["video_id"] = video_id
         output_result["detection_count"] = detection_count
         output_result["text_prompt"] = request.text_prompt
+
+        # Clean up GPU memory after processing
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
         return output_result
 
