@@ -1,0 +1,120 @@
+diff --git a/sam3/model/trt_export.py b/sam3/model/trt_export.py
+index e2edc05..62ebf6a 100644
+--- a/sam3/model/trt_export.py
++++ b/sam3/model/trt_export.py
+@@ -510,6 +510,7 @@ def export_vit_to_onnx(
+     output_path: str,
+     opset_version: int = 18,
+     batch_size: int = 1,
++    export_image_size: Optional[int] = None,
+     verbose: bool = False,
+ ) -> None:
+     """
+@@ -520,16 +521,27 @@ def export_vit_to_onnx(
+         output_path: Path for ONNX file output
+         opset_version: ONNX opset version (18+ recommended for transformers)
+         batch_size: Fixed batch size for export
++        export_image_size: Image size for export (smaller = less memory during tracing).
++                          If None, uses 504 (36x36 patches) to avoid OOM.
++                          TRT engine can still use different input sizes.
+         verbose: Whether to print verbose export info
+     """
+     model.eval()
+ 
+-    # Create dummy input with fixed shape
++    # Use smaller image size for ONNX tracing to avoid OOM crashes
++    # Full 1008x1008 (72x72 patches) creates ~40GB+ computation graph
++    # 504x504 (36x36 patches) is much more manageable (~10GB)
++    if export_image_size is None:
++        export_image_size = 504  # Safe default for 32GB Jetson
++        logger.info(f"Using reduced image size {export_image_size}x{export_image_size} for ONNX tracing (saves memory)")
++
++    # Create dummy input with reduced shape
+     dummy_input = torch.randn(
+-        batch_size, 3, model.image_size, model.image_size, device=next(model.parameters()).device
++        batch_size, 3, export_image_size, export_image_size, device=next(model.parameters()).device
+     )
+ 
+-    # Export to ONNX
++    # Export to ONNX with fixed shapes
++    # ViT uses pre-computed RoPE frequencies that depend on feature_size
+     torch.onnx.export(
+         model,
+         dummy_input,
+@@ -537,7 +549,7 @@ def export_vit_to_onnx(
+         opset_version=opset_version,
+         input_names=["image"],
+         output_names=["features"],
+-        dynamic_axes=None,  # Fixed shapes for optimal TRT performance
++        dynamic_axes=None,  # Fixed shapes - ViT has pre-computed positional embeddings
+         do_constant_folding=True,
+         verbose=verbose,
+     )
+@@ -594,6 +606,39 @@ def build_trt_engine(
+         trt.MemoryPoolType.WORKSPACE, int(workspace_size_gb * (1 << 30))
+     )
+ 
++    # Create optimization profile for any dynamic inputs
++    # This is required even if we specified fixed shapes in ONNX export
++    profile = builder.create_optimization_profile()
++    has_dynamic = False
++
++    for i in range(network.num_inputs):
++        input_tensor = network.get_input(i)
++        input_name = input_tensor.name
++        input_shape = input_tensor.shape
++
++        # Check if any dimension is dynamic (-1)
++        if -1 in input_shape:
++            has_dynamic = True
++            # Replace -1 with reasonable defaults based on input name
++            fixed_shape = list(input_shape)
++            for j, dim in enumerate(fixed_shape):
++                if dim == -1:
++                    # Use sensible defaults based on dimension position
++                    if j == 0:
++                        fixed_shape[j] = 1  # batch size
++                    elif j == 1:
++                        fixed_shape[j] = 3 if "image" in input_name.lower() else 256
++                    else:
++                        fixed_shape[j] = 504 if "image" in input_name.lower() else 72
++
++            fixed_shape = tuple(fixed_shape)
++            logger.info(f"Setting optimization profile for {input_name}: {fixed_shape}")
++            profile.set_shape(input_name, fixed_shape, fixed_shape, fixed_shape)
++
++    if has_dynamic:
++        config.add_optimization_profile(profile)
++        logger.info("Added optimization profile for dynamic inputs")
++
+     # Precision settings
+     if fp16:
+         config.set_flag(trt.BuilderFlag.FP16)
+@@ -756,15 +801,22 @@ def convert_sam3_vit_to_trt(
+             f"backbone type: {type(getattr(sam3_model, 'backbone', None))}"
+         )
+ 
+-    # Wrap for TRT export
+-    logger.info("Wrapping ViT backbone for TensorRT export...")
+-    wrapped_vit = TRTViTWrapper(vit)
+-    wrapped_vit = wrapped_vit.cuda().eval()
++    # Wrap for TRT export with reduced image size to avoid OOM during tracing
++    # 504x504 (36x36 patches) is much more memory-efficient than 1008x1008 (72x72 patches)
++    # The tracing computation graph scales quadratically with patch count
++    export_image_size = 504
++    logger.info(f"Wrapping ViT backbone for TensorRT export (image_size={export_image_size})...")
++    wrapped_vit = TRTViTWrapper(vit, image_size=export_image_size)
++
++    # Use CPU for ONNX tracing to avoid GPU memory exhaustion on Jetson
++    # TensorRT engine building will still use GPU
++    logger.info("Using CPU for ONNX export (avoids GPU memory issues)...")
++    wrapped_vit = wrapped_vit.cpu().eval()
+ 
+     # Export to ONNX
+     onnx_path = os.path.join(output_dir, "sam3_vit.onnx")
+     logger.info(f"Exporting to ONNX: {onnx_path}")
+-    export_vit_to_onnx(wrapped_vit, onnx_path)
++    export_vit_to_onnx(wrapped_vit, onnx_path, export_image_size=export_image_size)
+ 
+     # Build TRT engine
+     engine_path = os.path.join(output_dir, "sam3_vit.engine")

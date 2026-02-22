@@ -1,0 +1,326 @@
+diff --git a/sam3/model_builder.py b/sam3/model_builder.py
+index c6ec324..331e876 100644
+--- a/sam3/model_builder.py
++++ b/sam3/model_builder.py
+@@ -553,6 +553,197 @@ def _create_vision_backbone(
+     return vit_neck
+ 
+ 
++# ============================================================================
++# Perception Encoder (PE) Integration
++# Based on PE paper (arXiv:2504.13181) and SAM3 paper (arXiv:2511.16719)
++# ============================================================================
++
++
++def _create_pe_vision_backbone(
++    compile_mode=None,
++    enable_inst_interactivity: bool = False,
++    use_alignment_tuning: bool = True,
++    intermediate_layers: tuple = (7, 15, 23, 31),
++) -> Sam3DualViTDetNeck:
++    """
++    Create PE-enhanced visual backbone with alignment tuning.
++
++    Uses Perception Encoder's approach of extracting features from
++    intermediate layers and fusing them for improved dense prediction.
++
++    Args:
++        compile_mode: Torch compile mode
++        enable_inst_interactivity: Enable SAM2-style instance interactivity
++        use_alignment_tuning: Use intermediate layer fusion (PE paper)
++        intermediate_layers: Which ViT layers to extract features from
++
++    Returns:
++        Sam3DualViTDetNeck with PE backbone
++    """
++    from sam3.model.pe_encoder import PEVisionEncoder, PEViTNeckAdapter
++
++    # Position encoding
++    position_encoding = _create_position_encoding(precompute_resolution=1008)
++
++    # PE Vision Encoder with alignment tuning
++    pe_encoder = PEVisionEncoder(
++        img_size=1008,
++        patch_size=14,
++        embed_dim=1024,
++        depth=32,
++        num_heads=16,
++        mlp_ratio=4.625,
++        intermediate_layers=intermediate_layers if use_alignment_tuning else (31,),
++        output_dim=256,
++        use_alignment_tuning=use_alignment_tuning,
++        compile_mode=compile_mode,
++    )
++
++    # Wrap for neck compatibility
++    pe_backbone = PEViTNeckAdapter(pe_encoder)
++
++    # Create neck with PE backbone
++    vit_neck = Sam3DualViTDetNeck(
++        position_encoding=position_encoding,
++        d_model=256,
++        scale_factors=[4.0, 2.0, 1.0, 0.5],
++        trunk=pe_backbone,
++        add_sam2_neck=enable_inst_interactivity,
++    )
++
++    return vit_neck
++
++
++def _create_pe_text_encoder(bpe_path: str):
++    """
++    Create PE-aligned text encoder.
++
++    Uses a causal transformer architecture following PE paper's
++    text encoder design for improved vision-language alignment.
++
++    Args:
++        bpe_path: Path to BPE vocabulary file
++
++    Returns:
++        PETextEncoder instance
++    """
++    from sam3.model.pe_text_encoder import PETextEncoder
++
++    tokenizer = SimpleTokenizer(bpe_path=bpe_path)
++    return PETextEncoder(
++        tokenizer=tokenizer,
++        d_model=256,
++        width=1024,
++        heads=16,
++        layers=24,
++        max_seq_len=32,
++    )
++
++
++def build_sam3_pe_model(
++    bpe_path=None,
++    device="cuda" if torch.cuda.is_available() else "cpu",
++    eval_mode=True,
++    checkpoint_path=None,
++    load_from_HF=True,
++    use_alignment_tuning=True,
++    enable_segmentation=True,
++    enable_inst_interactivity=False,
++    compile=False,
++):
++    """
++    Build SAM3 with Perception Encoder backbone.
++
++    This variant uses PE's vision-language aligned representations
++    for improved text prompt understanding, following the PE paper's
++    approach of alignment tuning with intermediate features.
++
++    Key differences from standard SAM3:
++    - Uses PEVisionEncoder with intermediate layer fusion
++    - Uses PETextEncoder with causal transformer
++    - Alignment tuning projects intermediate features to output
++
++    Args:
++        bpe_path: Path to BPE tokenizer vocabulary
++        device: Device to load model on ('cuda' or 'cpu')
++        eval_mode: Whether to set model to evaluation mode
++        checkpoint_path: Path to model checkpoint
++        load_from_HF: Download from HuggingFace if checkpoint not provided
++        use_alignment_tuning: Use PE's intermediate feature fusion
++        enable_segmentation: Enable segmentation head
++        enable_inst_interactivity: Enable SAM2-style instance interactivity
++        compile: Enable torch.compile optimization
++
++    Returns:
++        SAM3 model with PE backbone
++    """
++    if bpe_path is None:
++        bpe_path = pkg_resources.resource_filename(
++            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
++        )
++
++    compile_mode = "default" if compile else None
++
++    # Create PE visual backbone
++    vision_encoder = _create_pe_vision_backbone(
++        compile_mode=compile_mode,
++        enable_inst_interactivity=enable_inst_interactivity,
++        use_alignment_tuning=use_alignment_tuning,
++    )
++
++    # Create PE text encoder
++    text_encoder = _create_pe_text_encoder(bpe_path)
++
++    # Create visual-language backbone
++    backbone = _create_vl_backbone(vision_encoder, text_encoder)
++
++    # Create transformer components (same as standard SAM3)
++    transformer = _create_sam3_transformer()
++
++    # Create dot product scoring
++    dot_prod_scoring = _create_dot_product_scoring()
++
++    # Create segmentation head if enabled
++    segmentation_head = (
++        _create_segmentation_head(compile_mode=compile_mode)
++        if enable_segmentation
++        else None
++    )
++
++    # Create geometry encoder
++    input_geometry_encoder = _create_geometry_encoder()
++
++    # Create instance interactivity predictor if enabled
++    if enable_inst_interactivity:
++        sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False)
++        inst_predictor = SAM3InteractiveImagePredictor(sam3_pvs_base)
++    else:
++        inst_predictor = None
++
++    # Create the SAM3 model
++    model = _create_sam3_model(
++        backbone,
++        transformer,
++        input_geometry_encoder,
++        segmentation_head,
++        dot_prod_scoring,
++        inst_predictor,
++        eval_mode,
++    )
++
++    # Load checkpoint with PE-specific key remapping
++    if load_from_HF and checkpoint_path is None:
++        checkpoint_path = download_ckpt_from_hf()
++
++    if checkpoint_path is not None:
++        _load_pe_checkpoint(model, checkpoint_path)
++
++    # Setup device and mode
++    model = _setup_device_and_mode(model, device, eval_mode)
++
++    return model
++
++
+ def _create_sam3_transformer(has_presence_token: bool = True) -> TransformerWrapper:
+     """Create SAM3 transformer encoder and decoder."""
+     encoder: TransformerEncoderFusion = _create_transformer_encoder()
+@@ -586,6 +777,112 @@ def _load_checkpoint(model, checkpoint_path):
+         )
+ 
+ 
++def _load_pe_checkpoint(model, checkpoint_path):
++    """
++    Load standard SAM3 checkpoint into PE model with key remapping.
++
++    The PE model has a different structure:
++    - Standard: backbone.vision_backbone.trunk.*
++    - PE: backbone.vision_backbone.trunk.pe_encoder.backbone.*
++
++    This function remaps the vision backbone weights while leaving
++    PE-specific layers (alignment tuning, text encoder) randomly initialized.
++    """
++    with g_pathmgr.open(checkpoint_path, "rb") as f:
++        ckpt = torch.load(f, map_location="cpu", weights_only=True)
++    if "model" in ckpt and isinstance(ckpt["model"], dict):
++        ckpt = ckpt["model"]
++
++    # Extract detector weights
++    sam3_ckpt = {
++        k.replace("detector.", ""): v for k, v in ckpt.items() if "detector" in k
++    }
++
++    # Remap vision backbone weights for PE model
++    # Standard: backbone.vision_backbone.trunk.X
++    # PE: backbone.vision_backbone.trunk.pe_encoder.backbone.X
++    pe_ckpt = {}
++    vision_trunk_prefix = "backbone.vision_backbone.trunk."
++    pe_trunk_prefix = "backbone.vision_backbone.trunk.pe_encoder.backbone."
++
++    # Also need to remap neck convs which remain at the same level
++    neck_prefix = "backbone.vision_backbone.convs."
++    sam2_neck_prefix = "backbone.vision_backbone.sam2_convs."
++
++    loaded_vision_keys = 0
++    skipped_text_keys = 0
++
++    for key, value in sam3_ckpt.items():
++        if key.startswith(vision_trunk_prefix):
++            # Check if this is a neck conv (stays at same level) or trunk (needs remapping)
++            suffix = key[len(vision_trunk_prefix):]
++            if suffix.startswith("convs.") or suffix.startswith("sam2_convs.") or suffix.startswith("position_encoding."):
++                # Neck and position encoding stay at same path
++                pe_ckpt[key] = value
++            else:
++                # Vision backbone trunk needs remapping
++                new_key = pe_trunk_prefix + suffix
++                pe_ckpt[new_key] = value
++                loaded_vision_keys += 1
++        elif key.startswith("backbone.vision_backbone.convs."):
++            # Neck convs stay at same path
++            pe_ckpt[key] = value
++        elif key.startswith("backbone.vision_backbone.sam2_convs."):
++            # SAM2 neck convs stay at same path
++            pe_ckpt[key] = value
++        elif key.startswith("backbone.vision_backbone.position_encoding."):
++            # Position encoding stays at same path
++            pe_ckpt[key] = value
++        elif key.startswith("backbone.language_backbone."):
++            # Skip standard text encoder weights - PE uses different architecture
++            skipped_text_keys += 1
++            continue
++        else:
++            # Other weights (transformer, decoder, etc.) stay at same path
++            pe_ckpt[key] = value
++
++    # Handle instance predictor if present
++    if model.inst_interactive_predictor is not None:
++        pe_ckpt.update(
++            {
++                k.replace("tracker.", "inst_interactive_predictor.model."): v
++                for k, v in ckpt.items()
++                if "tracker" in k
++            }
++        )
++
++    print(f"PE checkpoint loading: {loaded_vision_keys} vision backbone keys remapped, "
++          f"{skipped_text_keys} text encoder keys skipped (PE uses different architecture)")
++
++    missing_keys, unexpected_keys = model.load_state_dict(pe_ckpt, strict=False)
++
++    # Filter out expected missing keys (PE-specific and text encoder)
++    expected_missing_prefixes = [
++        "backbone.vision_backbone.trunk.pe_encoder.alignment_layers.",
++        "backbone.vision_backbone.trunk.pe_encoder.feature_fusion.",
++        "backbone.language_backbone.",
++    ]
++
++    unexpected_missing = [
++        k for k in missing_keys
++        if not any(k.startswith(prefix) for prefix in expected_missing_prefixes)
++    ]
++
++    if unexpected_missing:
++        print(f"WARNING: Unexpected missing keys in PE model:\n{unexpected_missing[:10]}...")
++        if len(unexpected_missing) > 10:
++            print(f"  ... and {len(unexpected_missing) - 10} more")
++
++    # Report PE-specific layers that need training
++    pe_specific = [k for k in missing_keys if any(k.startswith(prefix) for prefix in expected_missing_prefixes[:2])]
++    text_encoder = [k for k in missing_keys if k.startswith("backbone.language_backbone.")]
++
++    print(f"PE-specific layers initialized randomly: {len(pe_specific)} keys "
++          f"(alignment tuning, feature fusion)")
++    print(f"Text encoder initialized randomly: {len(text_encoder)} keys "
++          f"(PE text encoder architecture)")
++
++
+ def _setup_device_and_mode(model, device, eval_mode):
+     """Setup model device and evaluation mode."""
+     if device == "cuda":
+@@ -679,6 +976,10 @@ def build_sam3_image_model(
+     return model
+ 
+ 
++# Alias for backwards compatibility
++build_sam3_hiera_l = build_sam3_image_model
++
++
+ def download_ckpt_from_hf():
+     SAM3_MODEL_ID = "facebook/sam3"
+     SAM3_CKPT_NAME = "sam3.pt"
