@@ -395,6 +395,29 @@ if [ "$DOCKER_ONLY" = false ]; then
     print_success "Database directory: $DB_DIR"
     print_success "Engine directory: $ENGINE_DIR"
     print_info "Database will be initialized on first API request"
+
+    # Apply vendored SAM3 patches (TRT export, PE encoder, etc.)
+    print_header "Applying SAM3 Patches"
+
+    if [ -d "patches/sam3/model" ] && [ -d "sam3/sam3/model" ]; then
+        for f in patches/sam3/model/*.py; do
+            fname="$(basename "$f")"
+            cp "$f" "sam3/sam3/model/$fname"
+            print_success "Copied $fname -> sam3/sam3/model/"
+        done
+
+        if [ -f "patches/model_builder.patch" ]; then
+            if git -C sam3 apply --check "../patches/model_builder.patch" 2>/dev/null; then
+                git -C sam3 apply "../patches/model_builder.patch"
+                print_success "Applied model_builder.patch"
+            else
+                print_info "model_builder.patch already applied or not needed"
+            fi
+        fi
+    else
+        print_warning "patches/ directory not found — skipping SAM3 patching"
+        print_info "If sam3.model.trt_export is missing, see patches/README.md"
+    fi
 fi
 
 # Build Docker image FIRST (needed for TRT export to match container's TRT version)
