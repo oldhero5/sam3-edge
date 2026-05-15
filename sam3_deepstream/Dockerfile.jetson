@@ -54,7 +54,7 @@ RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple/ \
 
 # Copy sam3_deepstream package
 COPY sam3_deepstream/sam3_deepstream /workspace/sam3_deepstream
-COPY pyproject.toml /workspace/
+COPY sam3_deepstream/pyproject.toml /workspace/
 
 # Install sam3_deepstream (non-editable)
 RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple/ \

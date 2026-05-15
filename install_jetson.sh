@@ -333,9 +333,15 @@ if [ "$DOCKER_ONLY" = false ]; then
     # Install Python dependencies
     print_header "Installing Python Dependencies"
 
+    # Use the system interpreter explicitly for these checks: an active venv
+    # (e.g. VS Code's auto-activated .venv) shadows /usr/bin/python3 and would
+    # report the venv's pip-installed CPU-only torch instead of Jetson's
+    # CUDA-enabled system torch.
+    SYS_PY="/usr/bin/python3"
+
     # Verify Jetson PyTorch is available before proceeding
-    if python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'" 2>/dev/null; then
-        TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
+    if "$SYS_PY" -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'" 2>/dev/null; then
+        TORCH_VERSION=$("$SYS_PY" -c "import torch; print(torch.__version__)")
         print_success "Jetson PyTorch with CUDA detected: $TORCH_VERSION"
     else
         print_error "System PyTorch with CUDA not found"
@@ -344,8 +350,8 @@ if [ "$DOCKER_ONLY" = false ]; then
     fi
 
     # Verify torchvision is available
-    if python3 -c "import torchvision" 2>/dev/null; then
-        TV_VERSION=$(python3 -c "import torchvision; print(torchvision.__version__)")
+    if "$SYS_PY" -c "import torchvision" 2>/dev/null; then
+        TV_VERSION=$("$SYS_PY" -c "import torchvision; print(torchvision.__version__)")
         print_success "Jetson torchvision detected: $TV_VERSION"
     else
         print_error "torchvision not found in system packages"
@@ -355,8 +361,9 @@ if [ "$DOCKER_ONLY" = false ]; then
         print_info ""
         print_info "Run these commands manually:"
         echo ""
-        echo "  sudo pip3 install --no-cache-dir torch==2.8.0 torchvision==0.23.0 \\"
-        echo "      --index-url=https://pypi.jetson-ai-lab.io/jp6/cu126"
+        echo "  sudo pip3 install --no-cache-dir torchvision==0.24.1 \\"
+        echo "      --index-url=https://pypi.jetson-ai-lab.io/jp6/cu126 \\"
+        echo "      --ignore-installed sympy"
         echo ""
         print_info "Then re-run this script."
         exit 1
@@ -364,22 +371,23 @@ if [ "$DOCKER_ONLY" = false ]; then
 
     # Double-check that PyTorch still has CUDA after torchvision import
     # (This catches the case where a broken torchvision pulled in CPU-only torch)
-    if ! python3 -c "import torch; import torchvision; assert torch.cuda.is_available(), 'CUDA broken'" 2>/dev/null; then
+    if ! "$SYS_PY" -c "import torch; import torchvision; assert torch.cuda.is_available(), 'CUDA broken'" 2>/dev/null; then
         print_error "PyTorch CUDA is broken after loading torchvision!"
         print_info "This usually means a CPU-only torch was installed from PyPI."
         print_info ""
         print_info "Fix with:"
         echo ""
         echo "  sudo pip3 uninstall -y torch torchvision"
-        echo "  sudo pip3 install --no-cache-dir torch==2.8.0 torchvision==0.23.0 \\"
-        echo "      --index-url=https://pypi.jetson-ai-lab.io/jp6/cu126"
+        echo "  sudo pip3 install --no-cache-dir torchvision==0.24.1 \\"
+        echo "      --index-url=https://pypi.jetson-ai-lab.io/jp6/cu126 \\"
+        echo "      --ignore-installed sympy"
         echo ""
         exit 1
     fi
 
     print_info "Creating virtual environment with system site packages..."
     # Use system-site-packages to inherit Jetson's PyTorch with CUDA
-    uv venv --system-site-packages
+    uv venv --system-site-packages --clear
 
     print_info "Syncing workspace dependencies..."
     # Skip torch/torchvision/triton - Jetson uses NVIDIA's pre-built PyTorch from JetPack
@@ -424,19 +432,15 @@ fi
 if [ "$SKIP_DOCKER" = false ]; then
     print_header "Building Docker Image"
 
-    cd sam3_deepstream
-
     print_info "Building Jetson Docker image..."
-    docker build -f Dockerfile.jetson -t sam3-edge:jetson .
+    docker build -f sam3_deepstream/Dockerfile.jetson -t sam3-edge:jetson .
 
     print_success "Docker image built: sam3-edge:jetson"
 
     # Tag with version
-    VERSION=$(grep 'version' pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+    VERSION=$(grep 'version' sam3_deepstream/pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
     docker tag sam3-edge:jetson sam3-edge:jetson-$VERSION
     print_success "Tagged as: sam3-edge:jetson-$VERSION"
-
-    cd ..
 fi
 
 # Export TensorRT engines INSIDE Docker container
@@ -515,8 +519,8 @@ try:
 
     # Download SAM3 model (adjust repo_id to actual SAM3 repo)
     downloaded = hf_hub_download(
-        repo_id="facebook/sam3-hiera-large",  # SAM3 repo
-        filename="sam3_hiera_large.pt",
+        repo_id="facebook/sam3",  # SAM3 repo
+        filename="sam3.pt",
         local_dir=os.path.dirname(checkpoint_path),
         token=hf_token
     )
@@ -606,6 +610,64 @@ if [ "$DOCKERHUB_PUSH" = true ]; then
     print_info "Pull with: docker pull $DOCKERHUB_REPO:jetson-latest"
 fi
 
+# Ensure SAM3 checkpoint is at the canonical runtime mount location.
+# docker-compose.jetson.yml mounts ~/.cache/sam3_deepstream/checkpoints into
+# the container, so an existing checkpoint at ./sam3/checkpoints/sam3.pt
+# (e.g. cloned alongside the repo) needs to be hardlinked into the cache dir.
+if [ "$SKIP_DOCKER" = false ]; then
+    print_header "Linking SAM3 Checkpoint"
+
+    CHECKPOINT_DEST="$HOME/.cache/sam3_deepstream/checkpoints/sam3.pt"
+    mkdir -p "$(dirname "$CHECKPOINT_DEST")"
+
+    if [ -f "$CHECKPOINT_DEST" ]; then
+        print_success "Checkpoint already at $CHECKPOINT_DEST"
+    else
+        # Use the same search paths as the TRT export step
+        LINK_SEARCH=(
+            "./sam3/checkpoints/sam3.pt"
+            "$HOME/.cache/sam3/checkpoints/sam3.pt"
+            "./checkpoints/sam3.pt"
+        )
+        FOUND_CHECKPOINT=""
+        for path in "${LINK_SEARCH[@]}"; do
+            if [ -f "$path" ]; then
+                FOUND_CHECKPOINT="$(realpath "$path")"
+                break
+            fi
+        done
+
+        if [ -n "$FOUND_CHECKPOINT" ]; then
+            if ln "$FOUND_CHECKPOINT" "$CHECKPOINT_DEST" 2>/dev/null; then
+                print_success "Hardlinked $FOUND_CHECKPOINT -> $CHECKPOINT_DEST"
+            else
+                # Different filesystem — fall back to copy
+                print_warning "Hardlink failed (cross-filesystem); copying instead..."
+                cp "$FOUND_CHECKPOINT" "$CHECKPOINT_DEST"
+                print_success "Copied $FOUND_CHECKPOINT -> $CHECKPOINT_DEST"
+            fi
+        else
+            print_warning "No SAM3 checkpoint found in local search paths."
+            print_info "Container will start in degraded mode (no inference)."
+            print_info "Provide one at: $CHECKPOINT_DEST"
+        fi
+    fi
+fi
+
+# Bring up the API container so the freshly built image is what's running.
+if [ "$SKIP_DOCKER" = false ]; then
+    print_header "Starting SAM3 API Service"
+
+    print_info "Bringing up sam3-api via docker compose..."
+    if docker compose -f sam3_deepstream/docker-compose.jetson.yml up -d; then
+        print_success "Service started (or already up-to-date)"
+        print_info "Tail logs with: docker logs -f sam3_deepstream-sam3-api-1"
+    else
+        print_warning "docker compose up failed — start the service manually:"
+        print_info "  cd sam3_deepstream && docker compose -f docker-compose.jetson.yml up -d"
+    fi
+fi
+
 # Summary
 print_header "Installation Complete!"
 
@@ -614,21 +676,18 @@ echo -e "${GREEN}SAM3-Edge is ready for Jetson AGX Orin${NC}\n"
 echo "Quick Start:"
 echo "─────────────────────────────────────────────────────────────"
 echo ""
-echo "1. Start the API server with Docker:"
-echo -e "   ${CYAN}cd sam3_deepstream && docker compose -f docker-compose.jetson.yml up -d${NC}"
-echo ""
-echo "2. Check the health endpoint:"
+echo "1. Check the health endpoint:"
 echo -e "   ${CYAN}curl http://localhost:8000/health${NC}"
 echo ""
-echo "3. Submit a text prompt detection:"
+echo "2. Submit a text prompt detection:"
 echo -e "   ${CYAN}curl -X POST http://localhost:8000/api/v1/detect \\"
 echo "     -F 'file=@video.mp4' \\"
 echo -e "     -F 'text_prompt=green traffic lights'${NC}"
 echo ""
-echo "4. Search detected objects:"
+echo "3. Search detected objects:"
 echo -e "   ${CYAN}curl 'http://localhost:8000/api/v1/search?q=traffic+light'${NC}"
 echo ""
-echo "5. List all detected objects:"
+echo "4. List all detected objects:"
 echo -e "   ${CYAN}curl http://localhost:8000/api/v1/objects${NC}"
 echo ""
 
