@@ -213,6 +213,10 @@ class TRTInferenceEngine:
 
         self.context = self.engine.create_execution_context()
 
+        # Dedicated stream — passing the default stream to enqueueV3() makes
+        # TRT issue extra cudaStreamSynchronize() calls and emit a warning.
+        self.stream = torch.cuda.Stream(device=device)
+
         # Get IO tensor info
         self.inputs: Dict[str, dict] = {}
         self.outputs: Dict[str, dict] = {}
@@ -296,14 +300,15 @@ class TRTInferenceEngine:
         if self._buffers[input_name].shape != image.shape:
             self.allocate_buffers(**{input_name: image.shape})
 
-        # Copy input
-        self._buffers[input_name].copy_(image)
-
-        # Run inference
-        self.context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
-        torch.cuda.synchronize()
-
-        return self._buffers[output_name].clone()
+        # Order our stream behind any pending work on the caller's stream
+        # so we read a consistent input tensor.
+        self.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.stream):
+            self._buffers[input_name].copy_(image, non_blocking=True)
+            self.context.execute_async_v3(self.stream.cuda_stream)
+            out = self._buffers[output_name].clone()
+        self.stream.synchronize()
+        return out
 
     def infer(self, **inputs) -> Dict[str, Tensor]:
         """
@@ -315,17 +320,12 @@ class TRTInferenceEngine:
         Returns:
             Dictionary of output name to tensor
         """
-        # Copy inputs
-        for name, tensor in inputs.items():
-            if name in self._buffers:
-                self._buffers[name].copy_(tensor)
-
-        # Run inference
-        self.context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
-        torch.cuda.synchronize()
-
-        # Return outputs
-        return {
-            name: self._buffers[name].clone()
-            for name in self.outputs
-        }
+        self.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.stream):
+            for name, tensor in inputs.items():
+                if name in self._buffers:
+                    self._buffers[name].copy_(tensor, non_blocking=True)
+            self.context.execute_async_v3(self.stream.cuda_stream)
+            outputs = {name: self._buffers[name].clone() for name in self.outputs}
+        self.stream.synchronize()
+        return outputs
