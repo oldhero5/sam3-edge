@@ -19,6 +19,14 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+# When this script runs from scripts/, the parent dir holds the
+# sam3_deepstream package. Put it on sys.path so `import sam3_deepstream`
+# picks up the local source (e.g. a bind-mounted dev copy in Docker)
+# instead of falling through to a stale pip-installed version.
+_PKG_PARENT = Path(__file__).resolve().parent.parent
+if str(_PKG_PARENT) not in sys.path:
+    sys.path.insert(0, str(_PKG_PARENT))
+
 import numpy as np
 
 logging.basicConfig(
