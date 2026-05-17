@@ -21,9 +21,12 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /workspace
 
-# Install system dependencies
+# Install system dependencies. ffmpeg (with libx264) is needed by the
+# video pipeline to encode broadly playable H.264 mp4 — OpenCV's mp4v
+# writer produces files that don't play in Safari/Quicktime/most browsers.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsqlite3-dev \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy constraints file first (for pip to use)
