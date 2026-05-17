@@ -39,7 +39,7 @@ services:
       - SAM3_ALIGNMENT_TUNING=${SAM3_ALIGNMENT_TUNING:-1}
       # TensorRT configuration
       - SAM3_USE_TRT=${SAM3_USE_TRT:-0}
-      - SAM3_ENGINE_DIR=/workspace/sam3_deepstream/engines
+      - SAM3_ENGINE_DIR=/workspace/engines
       # Output directory for saved results
       - SAM3_OUTPUT_DIR=/workspace/outputs
 

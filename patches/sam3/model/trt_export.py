@@ -801,10 +801,11 @@ def convert_sam3_vit_to_trt(
             f"backbone type: {type(getattr(sam3_model, 'backbone', None))}"
         )
 
-    # Wrap for TRT export with reduced image size to avoid OOM during tracing
-    # 504x504 (36x36 patches) is much more memory-efficient than 1008x1008 (72x72 patches)
-    # The tracing computation graph scales quadratically with patch count
-    export_image_size = 504
+    # Export at the size SAM3 actually runs at (1008x1008) so the engine
+    # is usable for the API path. The CPU-side ONNX trace below is heavy
+    # at this size (~40GB intermediate), but a 32GB Orin + swap can grind
+    # through if the rest of the system is quiet.
+    export_image_size = int(os.environ.get("SAM3_TRT_EXPORT_IMAGE_SIZE", "1008"))
     logger.info(f"Wrapping ViT backbone for TensorRT export (image_size={export_image_size})...")
     wrapped_vit = TRTViTWrapper(vit, image_size=export_image_size)
 
