@@ -557,15 +557,46 @@ class VideoProcessor:
         results: List[FrameResult],
         output_path: Path,
     ) -> dict:
-        """Generate video with mask overlays."""
+        """Generate video with mask overlays.
+
+        Encodes via ffmpeg/libx264 (H.264, yuv420p, +faststart) so the
+        resulting mp4 plays in Safari/Quicktime/browsers. OpenCV's only
+        working in-container codec is mp4v, which most consumer players
+        reject.
+        """
+        import shutil
+        import subprocess
+
         cap = cv2.VideoCapture(str(video_path))
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Create video writer
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+        ffmpeg_bin = shutil.which("ffmpeg")
+        proc = None
+        out = None
+        if ffmpeg_bin:
+            proc = subprocess.Popen(
+                [
+                    ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "rawvideo", "-pix_fmt", "bgr24",
+                    "-s", f"{width}x{height}", "-r", f"{fps}",
+                    "-i", "-",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-preset", "fast", "-crf", "23",
+                    "-movflags", "+faststart",
+                    str(output_path),
+                ],
+                stdin=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        else:
+            logger.warning(
+                "ffmpeg not found; falling back to OpenCV mp4v writer "
+                "(output may not play in Safari/Quicktime)"
+            )
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
         frame_idx = 0
         while True:
@@ -575,20 +606,24 @@ class VideoProcessor:
 
             if frame_idx < len(results):
                 result = results[frame_idx]
-
-                # Overlay masks
                 if result.masks:
-                    frame = visualize_masks(
-                        frame,
-                        result.masks,
-                        alpha=0.4,
-                    )
+                    frame = visualize_masks(frame, result.masks, alpha=0.4)
 
-            out.write(frame)
+            if proc is not None:
+                proc.stdin.write(frame.tobytes())
+            else:
+                out.write(frame)
             frame_idx += 1
 
         cap.release()
-        out.release()
+        if proc is not None:
+            proc.stdin.close()
+            rc = proc.wait()
+            if rc != 0:
+                err = proc.stderr.read().decode(errors="replace")
+                raise RuntimeError(f"ffmpeg encode failed (rc={rc}): {err}")
+        else:
+            out.release()
 
         return {
             "output_path": str(output_path),
