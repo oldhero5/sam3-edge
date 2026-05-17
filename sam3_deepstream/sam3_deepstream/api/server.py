@@ -182,20 +182,32 @@ class SAM3Runtime:
                 confidence_threshold=0.5
             )
 
-            # Optionally load TensorRT engines for accelerated inference
+            # Optionally swap the ViT trunk for a TensorRT engine so the
+            # encoder forward pass runs on TRT instead of PyTorch.
             if self.use_trt and self._engines_exist():
                 try:
-                    from sam3_deepstream.inference.trt_runtime import SAM3TRTRuntime
+                    from sam3_deepstream.inference.trt_trunk import TRTTrunkAdapter
+
                     encoder_path = self.engine_dir / "sam3_encoder.engine"
-                    decoder_path = self.engine_dir / "sam3_decoder.engine"
-                    self.trt_runtime = SAM3TRTRuntime(
-                        encoder_engine_path=encoder_path,
-                        decoder_engine_path=decoder_path if decoder_path.exists() else None,
-                    )
+                    adapter = TRTTrunkAdapter(encoder_path, device=0)
+
+                    vit_neck = self.model.backbone.vision_backbone
+                    expected_in = adapter.input_shape[-1]
+                    if expected_in != self.resolution:
+                        raise RuntimeError(
+                            f"TRT engine expects input size {expected_in} but "
+                            f"processor runs at {self.resolution} — re-export "
+                            f"with SAM3_TRT_EXPORT_IMAGE_SIZE={self.resolution}"
+                        )
+                    vit_neck.trunk = adapter
+                    self.trt_runtime = adapter
                     self.stats['trt_enabled'] = True
-                    logger.info(f"TensorRT engines loaded from {self.engine_dir}")
+                    logger.info(
+                        f"TRT trunk swap active: engine={encoder_path}, "
+                        f"input={adapter.input_shape}, output={adapter.output_shape}"
+                    )
                 except Exception as e:
-                    logger.warning(f"TRT loading failed, using PyTorch: {e}")
+                    logger.warning(f"TRT trunk swap failed, using PyTorch: {e}")
                     self.trt_runtime = None
 
             logger.info(f"SAM3 model loaded successfully with {backbone_type} backbone")
