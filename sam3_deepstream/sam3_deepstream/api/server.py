@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 # Configure logging
@@ -387,7 +387,7 @@ async def lifespan(app: FastAPI):
     from sam3_deepstream.config import get_config
     config = get_config()
     app.state.config = config
-    app.state.job_manager = JobManager(config)
+    app.state.job_manager = JobManager(config, inference_service=_runtime)
     app.state.job_manager.start()
     logger.info("Job manager started for video processing")
 
@@ -477,17 +477,22 @@ async def segment_with_text(
     file: UploadFile = File(...),
     text_prompt: str = Form(..., description="Text description of object to segment"),
     confidence_threshold: float = Form(0.5, description="Minimum confidence 0-1"),
+    format: str = Query("json", description="Response format: 'json' (default) or 'image' for the rendered PNG overlay"),
 ):
     """
     Segment objects using text prompt (SAM3 native VETextEncoder).
 
-    Returns JSON with detection results and RLE-encoded masks.
-    Also saves PNG overlay and JSON to outputs/ folder.
+    Default returns JSON with detection results and RLE-encoded masks.
+    Pass ``?format=image`` to get the rendered PNG overlay back directly.
+    The PNG is also always written to outputs/ alongside a JSON sidecar.
 
     Example:
         curl -X POST http://localhost:8000/api/v1/segment \\
           -F "file=@image.jpg" \\
           -F "text_prompt=red car" | jq
+
+        curl -X POST 'http://localhost:8000/api/v1/segment?format=image' \\
+          -F "file=@image.jpg" -F "text_prompt=red car" -o out.png
     """
     if not _runtime or not _runtime.processor:
         raise HTTPException(status_code=503, detail="Model not loaded")
@@ -588,6 +593,13 @@ async def segment_with_text(
         json_path = OUTPUT_DIR / f"{base_name}.json"
         with open(json_path, "w") as f:
             json.dump(response_data.model_dump(), f, indent=2)
+
+        if format == "image":
+            return FileResponse(
+                png_path,
+                media_type="image/png",
+                filename=png_path.name,
+            )
 
         return response_data
 

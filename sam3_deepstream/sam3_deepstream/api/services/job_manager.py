@@ -45,6 +45,7 @@ class JobManager:
         self,
         config: Optional[SAM3DeepStreamConfig] = None,
         max_concurrent: int = 2,
+        inference_service=None,
     ):
         """
         Initialize job manager.
@@ -52,9 +53,13 @@ class JobManager:
         Args:
             config: Configuration object
             max_concurrent: Maximum concurrent jobs
+            inference_service: Optional already-loaded SAM3Runtime so video
+                jobs reuse the API's model (with TRT trunk swap) instead of
+                building a separate one.
         """
         self.config = config or get_config()
         self.max_concurrent = max_concurrent
+        self._inference_service = inference_service
 
         self._jobs: Dict[str, Job] = {}
         self._queue: asyncio.Queue = asyncio.Queue()
@@ -66,7 +71,9 @@ class JobManager:
     def start(self) -> None:
         """Start job processing workers."""
         self._shutdown_event.clear()
-        self._processor = VideoProcessor(self.config)
+        self._processor = VideoProcessor(
+            self.config, inference_service=self._inference_service
+        )
 
         # Start worker thread
         self._loop = asyncio.new_event_loop()
@@ -122,10 +129,14 @@ class JobManager:
 
             output_path = self.config.api.output_dir / f"{job_id}{ext}"
 
-            # Progress callback
-            def update_progress(progress: float):
-                job.progress = min(progress, 1.0)
-                job.frames_processed = int(progress * (job.total_frames or 100))
+            # Progress callback — receives concrete frame counts so the
+            # status endpoint reflects real progress as the worker advances,
+            # not a stale snapshot from the last 10-frame milestone.
+            def update_progress(frames_processed: int, total_frames: int):
+                job.frames_processed = frames_processed
+                if total_frames:
+                    job.total_frames = total_frames
+                    job.progress = min(frames_processed / total_frames, 1.0)
 
             # Process video
             result = await self._processor.process_video(
