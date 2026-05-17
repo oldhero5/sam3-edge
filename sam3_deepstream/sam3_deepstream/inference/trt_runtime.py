@@ -1,6 +1,7 @@
 """TensorRT runtime wrapper for unified encoder/decoder inference."""
 
 import logging
+import threading
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
@@ -217,6 +218,11 @@ class TRTInferenceEngine:
         # TRT issue extra cudaStreamSynchronize() calls and emit a warning.
         self.stream = torch.cuda.Stream(device=device)
 
+        # One execution context + buffer set per engine, so concurrent callers
+        # (e.g. an /api/v1/segment request while a video job runs) must
+        # serialize. Cheap compared to the inference itself.
+        self._lock = threading.Lock()
+
         # Get IO tensor info
         self.inputs: Dict[str, dict] = {}
         self.outputs: Dict[str, dict] = {}
@@ -296,19 +302,20 @@ class TRTInferenceEngine:
         input_name = list(self.inputs.keys())[0]
         output_name = list(self.outputs.keys())[0]
 
-        # Ensure buffer matches input shape
-        if self._buffers[input_name].shape != image.shape:
-            self.allocate_buffers(**{input_name: image.shape})
+        with self._lock:
+            # Ensure buffer matches input shape
+            if self._buffers[input_name].shape != image.shape:
+                self.allocate_buffers(**{input_name: image.shape})
 
-        # Order our stream behind any pending work on the caller's stream
-        # so we read a consistent input tensor.
-        self.stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.stream):
-            self._buffers[input_name].copy_(image, non_blocking=True)
-            self.context.execute_async_v3(self.stream.cuda_stream)
-            out = self._buffers[output_name].clone()
-        self.stream.synchronize()
-        return out
+            # Order our stream behind any pending work on the caller's stream
+            # so we read a consistent input tensor.
+            self.stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.stream):
+                self._buffers[input_name].copy_(image, non_blocking=True)
+                self.context.execute_async_v3(self.stream.cuda_stream)
+                out = self._buffers[output_name].clone()
+            self.stream.synchronize()
+            return out
 
     def infer(self, **inputs) -> Dict[str, Tensor]:
         """
@@ -320,12 +327,13 @@ class TRTInferenceEngine:
         Returns:
             Dictionary of output name to tensor
         """
-        self.stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.stream):
-            for name, tensor in inputs.items():
-                if name in self._buffers:
-                    self._buffers[name].copy_(tensor, non_blocking=True)
-            self.context.execute_async_v3(self.stream.cuda_stream)
-            outputs = {name: self._buffers[name].clone() for name in self.outputs}
-        self.stream.synchronize()
-        return outputs
+        with self._lock:
+            self.stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.stream):
+                for name, tensor in inputs.items():
+                    if name in self._buffers:
+                        self._buffers[name].copy_(tensor, non_blocking=True)
+                self.context.execute_async_v3(self.stream.cuda_stream)
+                outputs = {name: self._buffers[name].clone() for name in self.outputs}
+            self.stream.synchronize()
+            return outputs

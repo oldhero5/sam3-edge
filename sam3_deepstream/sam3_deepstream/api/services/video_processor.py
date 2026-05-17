@@ -34,6 +34,7 @@ class VideoProcessor:
         self,
         config: Optional[SAM3DeepStreamConfig] = None,
         use_deepstream: bool = True,
+        inference_service=None,
     ):
         """
         Initialize video processor.
@@ -41,13 +42,19 @@ class VideoProcessor:
         Args:
             config: Configuration object
             use_deepstream: Whether to use DeepStream pipeline
+            inference_service: Optional already-loaded SAM3Runtime whose
+                Sam3Processor (with any TRT trunk swap) will be reused for
+                keyframe inference instead of building a second model copy.
         """
         self.config = config or get_config()
         self.use_deepstream = use_deepstream and self._check_deepstream()
 
         self._processor: Optional[KeyframeProcessor] = None
         self._propagator: Optional[MaskPropagator] = None
-        self._sam3_processor = None  # Cached SAM3 processor for text prompts
+        self._inference_service = inference_service
+        self._sam3_processor = (
+            inference_service.processor if inference_service is not None else None
+        )
 
     def _check_deepstream(self) -> bool:
         """Check if DeepStream is available."""
@@ -212,6 +219,11 @@ class VideoProcessor:
                 logger.error(f"Failed to build SAM3 model: {e}")
                 cap.release()
                 return {"error": str(e), "frames_processed": 0}
+        else:
+            logger.info(
+                "Reusing API SAM3 processor for video keyframes "
+                "(picks up TRT trunk swap if active)"
+            )
 
         # Update confidence threshold for this request
         processor = self._sam3_processor
@@ -360,9 +372,8 @@ class VideoProcessor:
             results.append(result)
             frame_idx += 1
 
-            if progress_callback and frame_idx % 10 == 0:
-                progress = frame_idx / total_frames
-                await asyncio.to_thread(progress_callback, progress)
+            if progress_callback:
+                await asyncio.to_thread(progress_callback, frame_idx, total_frames)
 
         cap.release()
 
@@ -503,9 +514,8 @@ class VideoProcessor:
             results.append(result)
             frame_idx += 1
 
-            if progress_callback and frame_idx % 10 == 0:
-                progress = frame_idx / total_frames
-                await asyncio.to_thread(progress_callback, progress)
+            if progress_callback:
+                await asyncio.to_thread(progress_callback, frame_idx, total_frames)
 
         cap.release()
 
